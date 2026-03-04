@@ -1,0 +1,215 @@
+===============================================================================
+  DDoS Detection Flow Dataset - Documentation
+  SDN-ML Integration Project
+===============================================================================
+
+  File:        datasets/flow_dataset.csv
+  Generator:   datasets/generate_full_dataset.py
+
+===============================================================================
+  1. DATASET OVERVIEW
+===============================================================================
+
+  Total Flows:        505,433 (production) / 50,000 (default sample)
+  File Format:        CSV (comma-separated values)
+  Columns:            11 (10 features + 1 label)
+  Collection Method:  Synthetic generation with realistic flow distributions
+  Generation Seed:    42 (for reproducibility)
+
+  The dataset simulates network flow statistics collected from an SDN
+  controller managing a spine-leaf topology (5 switches, 10 hosts). Flow
+  statistics are modeled after OpenFlow 1.3 flow table entries, capturing
+  the same fields that the Ryu controller extracts during live operation.
+
+  Generated using: python3 generate_full_dataset.py --total 505433
+
+===============================================================================
+  2. TRAFFIC DISTRIBUTION
+===============================================================================
+
+  Class Distribution:
+  -----------------------------------------------
+    Label 0 (Normal):   65%  (~328,531 flows)
+    Label 1 (Attack):   35%  (~176,902 flows)
+  -----------------------------------------------
+
+  Normal Traffic Subtypes (65% of total):
+  -----------------------------------------------
+    ICMP Ping:          30% of normal   (~98,559 flows)
+      Standard ping sessions between hosts, low packet rates.
+
+    TCP Data Transfer:  50% of normal  (~164,266 flows)
+      File transfers, database queries, general TCP communication.
+
+    HTTP Web Browsing:  20% of normal   (~65,706 flows)
+      Short web page requests via TCP port 80.
+  -----------------------------------------------
+
+  Attack Traffic Subtypes (35% of total):
+  -----------------------------------------------
+    ICMP Flood:         33.3% of attack (~58,934 flows)
+      High-rate ICMP echo requests with spoofed source IPs.
+
+    SYN Flood:          33.3% of attack (~58,934 flows)
+      TCP SYN packets targeting port 80 with spoofed sources.
+
+    UDP Flood:          33.4% of attack (~59,034 flows)
+      High-rate UDP packets targeting port 53 (DNS).
+  -----------------------------------------------
+
+===============================================================================
+  3. FEATURE DESCRIPTIONS
+===============================================================================
+
+  All 10 features are listed in their required column order. This order
+  must be maintained across all components: dataset generation, model
+  training, controller feature extraction, and utility modules.
+
+  Col  Feature                     Description
+  ---  --------------------------  -------------------------------------------
+   1   flow_duration_sec           Duration of the flow in seconds. Normal
+                                   flows range from 0.1s to 300s. Attack
+                                   flows are typically shorter (0.1s to 10s).
+
+   2   idle_timeout                OpenFlow idle timeout in seconds. Normal
+                                   flows: 5-60s. Attack flows: 0-5s.
+
+   3   hard_timeout                OpenFlow hard timeout in seconds. Normal
+                                   flows: 10-300s. Attack flows: 0-10s.
+
+   4   packet_count                Total packets transmitted in the flow.
+                                   Normal: 5-5,000 packets.
+                                   Attack: 5,000-100,000 packets.
+
+   5   byte_count                  Total bytes transmitted in the flow.
+                                   Normal: 500-500,000 bytes.
+                                   Attack: 300,000-5,000,000 bytes.
+
+   6   packet_count_per_second     Packet rate (packet_count / duration).
+                                   Normal: 1-100 pps.
+                                   Attack: 5,000-100,000+ pps.
+                                   KEY DIFFERENTIATOR for detection.
+
+   7   byte_count_per_second       Byte rate (byte_count / duration).
+                                   Normal: 100-10,000 Bps.
+                                   Attack: 100,000-5,000,000+ Bps.
+                                   KEY DIFFERENTIATOR for detection.
+
+   8   ip_proto                    IP protocol number.
+                                   1 = ICMP (ping and ICMP flood)
+                                   6 = TCP  (data, HTTP, and SYN flood)
+                                   17 = UDP (UDP flood)
+
+   9   icmp_code                   ICMP code field. Set to 0 for echo
+                                   requests and for non-ICMP protocols.
+
+  10   icmp_type                   ICMP type field.
+                                   8 = Echo request (ping and ICMP flood)
+                                   0 = Not applicable (TCP/UDP flows)
+
+  Label Column:
+  ---  --------------------------  -------------------------------------------
+  11   label                       Classification target.
+                                   0 = Normal traffic
+                                   1 = DDoS attack traffic
+
+===============================================================================
+  4. DATA QUALITY
+===============================================================================
+
+  Missing Values:
+    None. The generator validates that no NaN or Inf values are present.
+    Rows with missing values should be dropped during preprocessing:
+      df.dropna(inplace=True)
+
+  Value Ranges:
+    All numeric features are non-negative. Rate features (columns 6-7)
+    are calculated from counts and duration, never generated independently,
+    ensuring physical consistency.
+
+  Noise:
+    Gaussian noise at 5% of each value is applied during generation to
+    prevent identical flow records and improve model generalization.
+
+  Normalization:
+    Features have vastly different scales (e.g., ip_proto is 1-17 while
+    byte_count can reach 5,000,000). StandardScaler normalization is
+    REQUIRED before training and prediction:
+
+      from sklearn.preprocessing import StandardScaler
+      scaler = StandardScaler()
+      X_train_scaled = scaler.fit_transform(X_train)   # Fit on train only
+      X_test_scaled = scaler.transform(X_test)          # Transform test
+
+    IMPORTANT: Fit the scaler on training data ONLY to prevent data
+    leakage. The fitted scaler is saved as ml_model/scaler.pkl for use
+    by the SDN controller during live prediction.
+
+  Class Balance:
+    The 65/35 normal/attack split is maintained through stratified
+    sampling during train/test split:
+
+      X_train, X_test, y_train, y_test = train_test_split(
+          X, y, test_size=0.25, random_state=42, stratify=y
+      )
+
+    Stratification ensures both training and test sets preserve the
+    original class distribution, preventing biased evaluation.
+
+===============================================================================
+  5. USAGE NOTES
+===============================================================================
+
+  Preprocessing Pipeline:
+    1. Load CSV:           df = pd.read_csv('flow_dataset.csv')
+    2. Drop NaN:           df.dropna(inplace=True)
+    3. Replace Inf:        df.replace([np.inf, -np.inf], 0, inplace=True)
+    4. Separate X and y:   X = df[feature_columns], y = df['label']
+    5. Split 75/25:        train_test_split(stratify=y, random_state=42)
+    6. Fit scaler:         scaler.fit_transform(X_train)
+    7. Transform test:     scaler.transform(X_test)
+
+  Train/Test Split:
+    - Ratio: 75% training, 25% testing
+    - Random state: 42 (for reproducibility across scripts)
+    - Stratification: Always use stratify=y to maintain class balance
+    - The same split parameters are used by both train_model.py and
+      create_roc.py to ensure evaluation consistency
+
+  Model Configuration:
+    - Algorithm: RandomForestClassifier
+    - n_estimators: 100
+    - max_depth: 20
+    - random_state: 42
+
+  Target Performance (with full 505,433-flow dataset):
+    - Accuracy:   84.5%
+    - Precision:  85.2%
+    - Recall:     83.8%
+    - F1-Score:   84.5%
+    - ROC AUC:    0.845
+
+  Feature Importance (expected ranking):
+    The most discriminative features are typically:
+    1. packet_count_per_second  (strongest: attacks have 100x+ normal rates)
+    2. byte_count_per_second    (strong: high bandwidth in attacks)
+    3. packet_count             (strong: volume indicator)
+    4. byte_count               (moderate: total transfer size)
+    5. flow_duration_sec        (moderate: attacks tend to be shorter)
+
+  Regenerating the Dataset:
+    python3 generate_full_dataset.py --total 505433 --seed 42
+
+    The --seed flag ensures identical output for reproducibility.
+    Use different seeds to generate variant datasets for robustness testing.
+
+  File Dependencies:
+    This dataset is consumed by:
+      - ml_model/train_model.py      (model training)
+      - ml_model/create_roc.py       (ROC curve generation)
+    The trained model is consumed by:
+      - sdn_controller/mitigation_module.py  (live detection)
+
+===============================================================================
+  END OF DOCUMENTATION
+===============================================================================
