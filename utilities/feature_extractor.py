@@ -2,97 +2,105 @@
 """
 Feature Extraction Utility for DDoS Detection
 
-Provides standalone functions for extracting and validating the 10 flow-based
-features used by the Random Forest classifier. This module can be imported
-by other components or used directly for testing.
+This module is the SINGLE SOURCE OF TRUTH for the ML feature set.
+All other modules import feature definitions from here:
+    - sdn_controller/mitigation_module.py
+    - ml_model/train_model.py
+    - ml_model/create_roc.py
+    - datasets/generate_full_dataset.py
+    - utilities/dataset_collector.py
 
-The feature extraction logic here must stay synchronized with:
-    - sdn_controller/mitigation_module.py (flow_stats_reply_handler)
-    - ml_model/train_model.py (FEATURE_COLUMNS)
-    - datasets/generate_full_dataset.py (CSV column order)
+Features (12 total, in exact order):
+    1.  flow_duration_sec        - Flow duration in seconds
+    2.  packet_count             - Total packets in flow
+    3.  byte_count               - Total bytes in flow
+    4.  packet_count_per_second  - Packets per second rate
+    5.  byte_count_per_second    - Bytes per second rate
+    6.  avg_packet_size          - Average bytes per packet
+    7.  ip_proto                 - IP protocol number (1=ICMP, 6=TCP, 17=UDP)
+    8.  icmp_code                - ICMP code value
+    9.  icmp_type                - ICMP type value
+    10. flows_to_dst             - Number of flows targeting same destination
+    11. unique_sources_to_dst    - Unique source IPs targeting same destination
+    12. flow_creation_rate       - New flows per second to same destination
 
-Features (in exact order):
-    1. flow_duration_sec       - Flow duration in seconds
-    2. idle_timeout            - Idle timeout value
-    3. hard_timeout            - Hard timeout value
-    4. packet_count            - Total packets in flow
-    5. byte_count              - Total bytes in flow
-    6. packet_count_per_second - Packets per second rate
-    7. byte_count_per_second   - Bytes per second rate
-    8. ip_proto                - IP protocol number (1=ICMP, 6=TCP, 17=UDP)
-    9. icmp_code               - ICMP code value
-    10. icmp_type              - ICMP type value
+Changes from previous 10-feature set:
+    - REMOVED: idle_timeout, hard_timeout (feature leakage — controller-set
+      values that differ between training and serving)
+    - ADDED: avg_packet_size (proxy for TCP flag behavior; SYN floods have
+      tiny packets, normal TCP has larger ones)
+    - ADDED: flows_to_dst, unique_sources_to_dst, flow_creation_rate
+      (aggregate behavior features that capture DDoS patterns invisible
+      at the individual flow level)
 
 Usage:
-    As module:
-        from utilities.feature_extractor import extract_flow_features, validate_features
-        features = extract_flow_features(flow_stats_dict)
-        valid, error = validate_features(features)
-
-    Standalone test:
-        cd utilities
-        python3 feature_extractor.py
+    from utilities.feature_extractor import (
+        FEATURE_NAMES, EXPECTED_FEATURE_COUNT, CSV_HEADERS,
+        extract_flow_features, validate_features
+    )
 
 """
 
 import numpy as np
 
 
-# Feature names in exact extraction order
-# This list is the single source of truth for feature ordering
+# Feature names in exact extraction order — the canonical definition.
+# Every module that uses features MUST import this list.
 FEATURE_NAMES = [
     'flow_duration_sec',
-    'idle_timeout',
-    'hard_timeout',
     'packet_count',
     'byte_count',
     'packet_count_per_second',
     'byte_count_per_second',
+    'avg_packet_size',
     'ip_proto',
     'icmp_code',
-    'icmp_type'
+    'icmp_type',
+    'flows_to_dst',
+    'unique_sources_to_dst',
+    'flow_creation_rate',
 ]
 
-EXPECTED_FEATURE_COUNT = 10
+EXPECTED_FEATURE_COUNT = len(FEATURE_NAMES)  # 12
+
+# CSV column headers for dataset files: features + label
+CSV_HEADERS = FEATURE_NAMES + ['label']
+
+# Label column name
+LABEL_COLUMN = 'label'
 
 
-def extract_flow_features(flow_stats):
+def extract_flow_features(flow_stats, aggregates=None):
     """
-    Extract 10 ML features from a flow statistics dictionary.
+    Extract 12 ML features from a flow statistics dictionary.
 
     Extracts features in the exact order expected by the trained Random
     Forest model and StandardScaler. Missing fields default to 0.
-    Rate features (packets/s, bytes/s) handle division by zero when
-    flow duration is 0 by falling back to the raw count.
+    Rate features handle division by zero when duration or packet count
+    is 0 by falling back to safe defaults.
 
     Args:
-        flow_stats (dict): Flow statistics dictionary containing any of
-            the following keys:
+        flow_stats (dict): Flow statistics dictionary containing any of:
             - duration_sec (int/float): Flow duration in seconds
-            - idle_timeout (int): Idle timeout value
-            - hard_timeout (int): Hard timeout value
             - packet_count (int): Total packet count
             - byte_count (int): Total byte count
             - ip_proto (int): IP protocol number
             - icmp_code (int): ICMP code
             - icmp_type (int): ICMP type
 
-            Rate features (packet_count_per_second, byte_count_per_second)
-            are calculated automatically from the above fields.
+        aggregates (dict, optional): Pre-computed aggregate features for
+            the destination IP of this flow. Expected keys:
+            - flows_to_dst (int): Number of flows targeting this dst
+            - unique_sources_to_dst (int): Unique src IPs targeting this dst
+            - flow_creation_rate (float): New flows per second to this dst
+            If None, aggregate features default to 0.
 
     Returns:
-        numpy.ndarray: Feature array with shape (1, 10), ready for
+        numpy.ndarray: Feature array with shape (1, 12), ready for
             scaler.transform() and model.predict().
 
     Raises:
         TypeError: If flow_stats is not a dictionary.
-
-    Examples:
-        >>> stats = {'duration_sec': 10, 'packet_count': 500,
-        ...          'byte_count': 50000, 'ip_proto': 6}
-        >>> features = extract_flow_features(stats)
-        >>> features.shape
-        (1, 10)
     """
     if not isinstance(flow_stats, dict):
         raise TypeError(
@@ -101,8 +109,6 @@ def extract_flow_features(flow_stats):
 
     # Extract base fields with default of 0 for missing keys
     duration_sec = flow_stats.get('duration_sec', 0)
-    idle_timeout = flow_stats.get('idle_timeout', 0)
-    hard_timeout = flow_stats.get('hard_timeout', 0)
     packet_count = flow_stats.get('packet_count', 0)
     byte_count = flow_stats.get('byte_count', 0)
     ip_proto = flow_stats.get('ip_proto', 0)
@@ -110,7 +116,6 @@ def extract_flow_features(flow_stats):
     icmp_type = flow_stats.get('icmp_type', 0)
 
     # Calculate rate features with division-by-zero protection
-    # When duration is 0 (flow just installed), use raw count as rate
     if duration_sec > 0:
         packet_count_per_second = packet_count / duration_sec
         byte_count_per_second = byte_count / duration_sec
@@ -118,22 +123,38 @@ def extract_flow_features(flow_stats):
         packet_count_per_second = packet_count
         byte_count_per_second = byte_count
 
-    # Assemble features in exact order matching training data columns
+    # Average packet size as proxy for TCP flag behavior
+    if packet_count > 0:
+        avg_packet_size = byte_count / packet_count
+    else:
+        avg_packet_size = 0
+
+    # Aggregate features (per-destination behavior)
+    if aggregates is not None:
+        flows_to_dst = aggregates.get('flows_to_dst', 0)
+        unique_sources_to_dst = aggregates.get('unique_sources_to_dst', 0)
+        flow_creation_rate = aggregates.get('flow_creation_rate', 0)
+    else:
+        flows_to_dst = 0
+        unique_sources_to_dst = 0
+        flow_creation_rate = 0
+
+    # Assemble features in exact order matching FEATURE_NAMES
     features = [
-        duration_sec,               # 1. flow_duration_sec
-        idle_timeout,               # 2. idle_timeout
-        hard_timeout,               # 3. hard_timeout
-        packet_count,               # 4. packet_count
-        byte_count,                 # 5. byte_count
-        packet_count_per_second,    # 6. packet_count_per_second
-        byte_count_per_second,      # 7. byte_count_per_second
-        ip_proto,                   # 8. ip_proto
-        icmp_code,                  # 9. icmp_code
-        icmp_type,                  # 10. icmp_type
+        duration_sec,               # 1.  flow_duration_sec
+        packet_count,               # 2.  packet_count
+        byte_count,                 # 3.  byte_count
+        packet_count_per_second,    # 4.  packet_count_per_second
+        byte_count_per_second,      # 5.  byte_count_per_second
+        avg_packet_size,            # 6.  avg_packet_size
+        ip_proto,                   # 7.  ip_proto
+        icmp_code,                  # 8.  icmp_code
+        icmp_type,                  # 9.  icmp_type
+        flows_to_dst,               # 10. flows_to_dst
+        unique_sources_to_dst,      # 11. unique_sources_to_dst
+        flow_creation_rate,         # 12. flow_creation_rate
     ]
 
-    # Return as numpy array shaped (1, 10) for sklearn compatibility
-    # scaler.transform() and model.predict() expect 2D input
     return np.array(features).reshape(1, -1)
 
 
@@ -141,47 +162,30 @@ def validate_features(features):
     """
     Validate a feature array for ML prediction compatibility.
 
-    Checks that the feature array has the correct shape (1, 10),
-    contains no NaN or Inf values, and is a numpy array. This
-    validation should be run before passing features to the scaler
-    or model.
+    Checks that the feature array has the correct shape (1, 12),
+    contains no NaN or Inf values, and is a numpy array.
 
     Args:
         features: Feature array to validate. Expected to be a numpy
-            ndarray with shape (1, 10).
+            ndarray with shape (1, 12).
 
     Returns:
         tuple: (is_valid, error_message) where:
             - is_valid (bool): True if features pass all checks.
             - error_message (str): Empty string if valid, otherwise
               a description of the first validation failure found.
-
-    Examples:
-        >>> features = np.array([[10, 5, 30, 100, 5000,
-        ...                       10.0, 500.0, 6, 0, 0]])
-        >>> valid, error = validate_features(features)
-        >>> valid
-        True
-
-        >>> bad = np.array([1, 2, 3])
-        >>> valid, error = validate_features(bad)
-        >>> valid
-        False
     """
-    # Check type
     if not isinstance(features, np.ndarray):
         return False, (
             f"Expected numpy.ndarray, got {type(features).__name__}"
         )
 
-    # Check shape is exactly (1, 10)
     if features.shape != (1, EXPECTED_FEATURE_COUNT):
         return False, (
             f"Expected shape (1, {EXPECTED_FEATURE_COUNT}), "
             f"got {features.shape}"
         )
 
-    # Check for NaN values
     nan_count = np.isnan(features).sum()
     if nan_count > 0:
         nan_indices = np.argwhere(np.isnan(features))
@@ -190,7 +194,6 @@ def validate_features(features):
             f"Found {nan_count} NaN value(s) in features: {nan_features}"
         )
 
-    # Check for Inf values
     inf_count = np.isinf(features).sum()
     if inf_count > 0:
         inf_indices = np.argwhere(np.isinf(features))
@@ -206,17 +209,14 @@ def features_to_dict(features):
     """
     Convert a feature array back to a labeled dictionary.
 
-    Useful for debugging and logging — maps each value in the feature
-    array to its corresponding feature name.
-
     Args:
-        features (numpy.ndarray): Feature array with shape (1, 10).
+        features (numpy.ndarray): Feature array with shape (1, 12).
 
     Returns:
         dict: Dictionary mapping feature names to their values.
 
     Raises:
-        ValueError: If features array does not have 10 elements.
+        ValueError: If features array does not have 12 elements.
     """
     values = features.flatten()
 
@@ -232,148 +232,152 @@ def features_to_dict(features):
 if __name__ == '__main__':
     """
     Demonstration and self-test for the feature extraction module.
-
-    Tests extraction with normal traffic, attack traffic, edge cases
-    (empty dict, zero duration), and validation scenarios.
     """
     print("=" * 60)
-    print("  Feature Extractor - Self Test")
+    print("  Feature Extractor - Self Test (12-feature set)")
     print("=" * 60)
 
     # =========================================================================
-    # Test 1: Normal TCP traffic
+    # Test 1: Normal TCP traffic with aggregates
     # =========================================================================
-    print("\n  Test 1: Normal TCP traffic")
+    print("\n  Test 1: Normal TCP traffic with aggregates")
     normal_stats = {
         'duration_sec': 15,
-        'idle_timeout': 10,
-        'hard_timeout': 30,
         'packet_count': 120,
         'byte_count': 84000,
         'ip_proto': 6,       # TCP
         'icmp_code': 0,
         'icmp_type': 0
     }
-    features = extract_flow_features(normal_stats)
+    normal_agg = {
+        'flows_to_dst': 5,
+        'unique_sources_to_dst': 3,
+        'flow_creation_rate': 0.5,
+    }
+    features = extract_flow_features(normal_stats, aggregates=normal_agg)
     valid, error = validate_features(features)
     print(f"    Shape: {features.shape}")
     print(f"    Valid: {valid}")
-    print(f"    Values: {features.flatten()}")
-    print(f"    PPS: {features[0][5]:.2f}, BPS: {features[0][6]:.2f}")
     assert valid, f"Validation failed: {error}"
-    assert features[0][5] == 120 / 15, "PPS calculation wrong"
+    assert features.shape == (1, 12), f"Wrong shape: {features.shape}"
+    assert features[0][3] == 120 / 15, "PPS calculation wrong"
+    assert features[0][5] == 84000 / 120, "avg_packet_size wrong"
+    assert features[0][9] == 5, "flows_to_dst wrong"
     print("    PASSED")
 
     # =========================================================================
-    # Test 2: ICMP Flood attack
+    # Test 2: ICMP Flood attack (high aggregates)
     # =========================================================================
     print("\n  Test 2: ICMP Flood attack traffic")
     attack_stats = {
         'duration_sec': 5,
-        'idle_timeout': 0,
-        'hard_timeout': 0,
         'packet_count': 50000,
         'byte_count': 3000000,
         'ip_proto': 1,       # ICMP
         'icmp_code': 0,
         'icmp_type': 8       # Echo request
     }
-    features = extract_flow_features(attack_stats)
+    attack_agg = {
+        'flows_to_dst': 150,
+        'unique_sources_to_dst': 80,
+        'flow_creation_rate': 30.0,
+    }
+    features = extract_flow_features(attack_stats, aggregates=attack_agg)
     valid, error = validate_features(features)
-    print(f"    Shape: {features.shape}")
-    print(f"    Valid: {valid}")
-    print(f"    PPS: {features[0][5]:.2f} (high = attack indicator)")
     assert valid, f"Validation failed: {error}"
-    assert features[0][5] == 10000.0, "PPS calculation wrong"
+    assert features[0][3] == 10000.0, "PPS calculation wrong"
+    assert features[0][5] == 3000000 / 50000, "avg_packet_size wrong"
+    assert features[0][9] == 150, "flows_to_dst wrong"
     print("    PASSED")
 
     # =========================================================================
-    # Test 3: Empty dictionary (all defaults)
+    # Test 3: No aggregates provided (defaults to 0)
     # =========================================================================
-    print("\n  Test 3: Empty dictionary (all defaults to 0)")
+    print("\n  Test 3: No aggregates (defaults to 0)")
+    features = extract_flow_features(normal_stats)
+    valid, error = validate_features(features)
+    assert valid
+    assert features[0][9] == 0, "flows_to_dst should be 0"
+    assert features[0][10] == 0, "unique_sources_to_dst should be 0"
+    assert features[0][11] == 0, "flow_creation_rate should be 0"
+    print("    PASSED")
+
+    # =========================================================================
+    # Test 4: Empty dictionary (all defaults)
+    # =========================================================================
+    print("\n  Test 4: Empty dictionary (all defaults to 0)")
     features = extract_flow_features({})
     valid, error = validate_features(features)
-    print(f"    Shape: {features.shape}")
-    print(f"    Valid: {valid}")
-    print(f"    All zeros: {np.all(features == 0)}")
-    assert valid, f"Validation failed: {error}"
+    assert valid
     assert np.all(features == 0), "Empty dict should produce all zeros"
     print("    PASSED")
 
     # =========================================================================
-    # Test 4: Zero duration (division by zero handling)
+    # Test 5: Zero duration and zero packet_count
     # =========================================================================
-    print("\n  Test 4: Zero duration (division by zero)")
-    zero_dur_stats = {
+    print("\n  Test 5: Zero duration (division by zero)")
+    features = extract_flow_features({
         'duration_sec': 0,
         'packet_count': 100,
         'byte_count': 5000
-    }
-    features = extract_flow_features(zero_dur_stats)
+    })
     valid, error = validate_features(features)
-    print(f"    Shape: {features.shape}")
-    print(f"    Valid: {valid}")
-    print(f"    PPS: {features[0][5]} (fallback to packet_count)")
-    print(f"    BPS: {features[0][6]} (fallback to byte_count)")
-    assert valid, f"Validation failed: {error}"
-    assert features[0][5] == 100, "Zero duration PPS fallback wrong"
-    assert features[0][6] == 5000, "Zero duration BPS fallback wrong"
+    assert valid
+    assert features[0][3] == 100, "Zero duration PPS fallback wrong"
+    assert features[0][4] == 5000, "Zero duration BPS fallback wrong"
+    assert features[0][5] == 50.0, "avg_packet_size wrong"
     print("    PASSED")
 
     # =========================================================================
-    # Test 5: Validation failures
+    # Test 6: Validation failures
     # =========================================================================
-    print("\n  Test 5: Validation failure cases")
-
-    # Wrong type
-    valid, error = validate_features([1, 2, 3])
-    print(f"    Wrong type:  valid={valid}, error='{error}'")
+    print("\n  Test 6: Validation failure cases")
+    valid, _ = validate_features([1, 2, 3])
     assert not valid
-
-    # Wrong shape
-    valid, error = validate_features(np.array([1, 2, 3]))
-    print(f"    Wrong shape: valid={valid}, error='{error}'")
+    valid, _ = validate_features(np.array([1, 2, 3]))
     assert not valid
-
-    # NaN values
-    nan_features = np.array([[1, 2, np.nan, 4, 5, 6, 7, 8, 9, 10]])
-    valid, error = validate_features(nan_features)
-    print(f"    NaN values:  valid={valid}, error='{error}'")
+    nan_f = np.zeros((1, 12)); nan_f[0][2] = np.nan
+    valid, _ = validate_features(nan_f)
     assert not valid
-
-    # Inf values
-    inf_features = np.array([[1, 2, 3, 4, 5, np.inf, 7, 8, 9, 10]])
-    valid, error = validate_features(inf_features)
-    print(f"    Inf values:  valid={valid}, error='{error}'")
+    inf_f = np.zeros((1, 12)); inf_f[0][4] = np.inf
+    valid, _ = validate_features(inf_f)
     assert not valid
-
     print("    PASSED")
 
     # =========================================================================
-    # Test 6: TypeError for non-dict input
+    # Test 7: TypeError for non-dict input
     # =========================================================================
-    print("\n  Test 6: TypeError for non-dict input")
+    print("\n  Test 7: TypeError for non-dict input")
     try:
         extract_flow_features("not a dict")
         assert False, "Should have raised TypeError"
-    except TypeError as e:
-        print(f"    Caught expected error: {e}")
+    except TypeError:
         print("    PASSED")
 
     # =========================================================================
-    # Test 7: features_to_dict round-trip
+    # Test 8: features_to_dict round-trip
     # =========================================================================
-    print("\n  Test 7: features_to_dict conversion")
-    features = extract_flow_features(normal_stats)
+    print("\n  Test 8: features_to_dict conversion")
+    features = extract_flow_features(normal_stats, aggregates=normal_agg)
     labeled = features_to_dict(features)
-    print(f"    Keys: {list(labeled.keys())}")
-    assert labeled['ip_proto'] == 6, "Round-trip failed"
-    assert labeled['flow_duration_sec'] == 15, "Round-trip failed"
+    assert labeled['ip_proto'] == 6
+    assert labeled['flow_duration_sec'] == 15
+    assert labeled['flows_to_dst'] == 5
+    assert len(labeled) == 12
+    print("    PASSED")
+
+    # =========================================================================
+    # Test 9: CSV_HEADERS has 13 entries (12 features + label)
+    # =========================================================================
+    print("\n  Test 9: CSV_HEADERS structure")
+    assert len(CSV_HEADERS) == 13, f"Expected 13, got {len(CSV_HEADERS)}"
+    assert CSV_HEADERS[-1] == 'label'
+    assert CSV_HEADERS[:12] == FEATURE_NAMES
     print("    PASSED")
 
     # =========================================================================
     # Summary
     # =========================================================================
     print("\n" + "=" * 60)
-    print("  All 7 tests PASSED")
+    print(f"  All 9 tests PASSED ({EXPECTED_FEATURE_COUNT} features)")
     print("=" * 60 + "\n")

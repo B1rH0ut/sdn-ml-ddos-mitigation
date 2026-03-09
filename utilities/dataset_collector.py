@@ -11,10 +11,8 @@ The CSV format produced by this module is consumed by:
     - ml_model/train_model.py (model training)
     - ml_model/create_roc.py (ROC curve generation)
 
-CSV columns (11 total):
-    flow_duration_sec, idle_timeout, hard_timeout, packet_count,
-    byte_count, packet_count_per_second, byte_count_per_second,
-    ip_proto, icmp_code, icmp_type, label
+CSV columns (13 total = 12 features + 1 label):
+    Defined in utilities/feature_extractor.py (single source of truth)
 
 Usage:
     As module:
@@ -33,25 +31,14 @@ Usage:
 import csv
 import os
 import fcntl
+import atexit
 from datetime import datetime
 
-
-# CSV column headers — must match train_model.py FEATURE_COLUMNS + label
-CSV_HEADERS = [
-    'flow_duration_sec',
-    'idle_timeout',
-    'hard_timeout',
-    'packet_count',
-    'byte_count',
-    'packet_count_per_second',
-    'byte_count_per_second',
-    'ip_proto',
-    'icmp_code',
-    'icmp_type',
-    'label'
-]
-
-EXPECTED_FEATURE_COUNT = 10
+# Import feature definitions from the single source of truth
+from utilities.feature_extractor import (
+    CSV_HEADERS,
+    EXPECTED_FEATURE_COUNT,
+)
 
 
 class DatasetCollector:
@@ -110,8 +97,15 @@ class DatasetCollector:
                 f"Cannot create output directory {output_dir}: {e}"
             )
 
+        # Write buffer to reduce file I/O and lock contention
+        self._buffer = []
+        self._buffer_size = 100
+
         # Create CSV file with headers if it doesn't exist
         self._ensure_csv_exists()
+
+        # Flush buffer on interpreter exit to avoid data loss
+        atexit.register(self.flush)
 
     def _ensure_csv_exists(self):
         """
@@ -160,11 +154,8 @@ class DatasetCollector:
         corruption from concurrent writes.
 
         Args:
-            features (list or array): List of 10 numeric feature values
-                in the standard order:
-                [flow_duration_sec, idle_timeout, hard_timeout,
-                 packet_count, byte_count, packet_count_per_second,
-                 byte_count_per_second, ip_proto, icmp_code, icmp_type]
+            features (list or array): List of feature values in the order
+                defined by feature_extractor.FEATURE_NAMES.
             label (int): Flow classification label.
                 0 = normal traffic, 1 = DDoS attack.
 
@@ -186,24 +177,11 @@ class DatasetCollector:
                 f"Label must be 0 (normal) or 1 (attack), got {label}"
             )
 
-        # Build the complete row: 10 features + label
+        # Build the complete row: features + label
         row = list(features) + [label]
 
-        # Append to CSV with file locking for concurrent write safety
-        try:
-            with open(self.output_file, 'a', newline='') as f:
-                # Acquire exclusive lock to prevent concurrent corruption
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    writer = csv.writer(f)
-                    writer.writerow(row)
-                finally:
-                    # Release lock
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except IOError as e:
-            raise IOError(
-                f"Failed to write to {self.output_file}: {e}"
-            )
+        # Buffer rows and flush when buffer is full
+        self._buffer.append(row)
 
         # Update session statistics
         self.total_count += 1
@@ -211,6 +189,9 @@ class DatasetCollector:
             self.normal_count += 1
         else:
             self.attack_count += 1
+
+        if len(self._buffer) >= self._buffer_size:
+            self.flush()
 
     def add_flows_batch(self, flows):
         """
@@ -228,8 +209,7 @@ class DatasetCollector:
             ValueError: If any flow has invalid features or label.
             IOError: If the CSV file cannot be written.
         """
-        # Validate all flows before writing any
-        rows = []
+        # Validate all flows before buffering
         for i, (features, label) in enumerate(flows):
             if len(features) != EXPECTED_FEATURE_COUNT:
                 raise ValueError(
@@ -240,21 +220,7 @@ class DatasetCollector:
                 raise ValueError(
                     f"Flow {i}: label must be 0 or 1, got {label}"
                 )
-            rows.append(list(features) + [label])
-
-        # Write all rows with a single lock acquisition
-        try:
-            with open(self.output_file, 'a', newline='') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    writer = csv.writer(f)
-                    writer.writerows(rows)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except IOError as e:
-            raise IOError(
-                f"Failed to write batch to {self.output_file}: {e}"
-            )
+            self._buffer.append(list(features) + [label])
 
         # Update session statistics
         for _, label in flows:
@@ -263,6 +229,35 @@ class DatasetCollector:
                 self.normal_count += 1
             else:
                 self.attack_count += 1
+
+        # Flush if buffer exceeded
+        if len(self._buffer) >= self._buffer_size:
+            self.flush()
+
+    def flush(self):
+        """
+        Flush buffered rows to the CSV file.
+
+        Writes all buffered rows in a single file open + lock acquisition,
+        then clears the buffer. Safe to call multiple times.
+        """
+        if not self._buffer:
+            return
+
+        try:
+            with open(self.output_file, 'a', newline='') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    writer = csv.writer(f)
+                    writer.writerows(self._buffer)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except IOError as e:
+            raise IOError(
+                f"Failed to flush buffer to {self.output_file}: {e}"
+            )
+
+        self._buffer.clear()
 
     def get_stats(self):
         """
@@ -371,10 +366,10 @@ if __name__ == '__main__':
     print("    PASSED")
 
     # =========================================================================
-    # Test 2: Add normal flow
+    # Test 2: Add normal flow (12 features)
     # =========================================================================
     print("\n  Test 2: Add normal flow")
-    normal_features = [15, 10, 30, 120, 84000, 8.0, 5600.0, 6, 0, 0]
+    normal_features = [15, 120, 84000, 8.0, 5600.0, 700.0, 6, 0, 0, 5, 3, 0.5]
     collector.add_flow(normal_features, label=0)
     assert collector.total_count == 1
     assert collector.normal_count == 1
@@ -386,7 +381,7 @@ if __name__ == '__main__':
     # Test 3: Add attack flow
     # =========================================================================
     print("\n  Test 3: Add attack flow")
-    attack_features = [5, 0, 0, 50000, 3000000, 10000.0, 600000.0, 1, 0, 8]
+    attack_features = [5, 50000, 3000000, 10000.0, 600000.0, 60.0, 1, 0, 8, 150, 80, 30.0]
     collector.add_flow(attack_features, label=1)
     assert collector.total_count == 2
     assert collector.normal_count == 1
@@ -399,9 +394,9 @@ if __name__ == '__main__':
     # =========================================================================
     print("\n  Test 4: Batch add")
     batch = [
-        ([10, 5, 30, 80, 40000, 8.0, 4000.0, 17, 0, 0], 0),
-        ([3, 0, 0, 80000, 5000000, 26666.7, 1666666.7, 17, 0, 0], 1),
-        ([20, 10, 30, 200, 150000, 10.0, 7500.0, 6, 0, 0], 0),
+        ([10, 80, 40000, 8.0, 4000.0, 500.0, 17, 0, 0, 3, 2, 0.3], 0),
+        ([3, 80000, 5000000, 26666.7, 1666666.7, 62.5, 17, 0, 0, 200, 100, 50.0], 1),
+        ([20, 200, 150000, 10.0, 7500.0, 750.0, 6, 0, 0, 8, 5, 1.0], 0),
     ]
     collector.add_flows_batch(batch)
     assert collector.total_count == 5
@@ -414,6 +409,7 @@ if __name__ == '__main__':
     # Test 5: Statistics
     # =========================================================================
     print("\n  Test 5: Statistics")
+    collector.flush()  # Flush buffer before checking file stats
     stats = collector.get_stats()
     assert stats['total'] == 5
     assert stats['normal'] == 3
@@ -468,7 +464,7 @@ if __name__ == '__main__':
     import pandas as pd
     df = pd.read_csv(test_file)
     assert len(df) == 5, f"Expected 5 rows, got {len(df)}"
-    assert len(df.columns) == 11, f"Expected 11 columns, got {len(df.columns)}"
+    assert len(df.columns) == len(CSV_HEADERS), f"Expected {len(CSV_HEADERS)} columns, got {len(df.columns)}"
     assert list(df.columns) == CSV_HEADERS, "Column names don't match"
     assert df['label'].isin([0, 1]).all(), "Invalid labels in CSV"
     print(f"    Rows: {len(df)}, Columns: {len(df.columns)}")

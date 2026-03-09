@@ -10,7 +10,8 @@
 # Switches configured: s1, s2 (spine), s3, s4, s5 (leaf)
 # Controller: tcp:127.0.0.1:6653
 # Protocol: OpenFlow 1.3
-# Fail-mode: secure (blocks traffic if controller disconnected)
+# Fail-mode: standalone (switches forward independently if controller disconnected)
+# Changed from 'secure' to prevent total network blackout on controller failure
 #
 # Usage:
 #     sudo bash ovs_config.sh
@@ -131,11 +132,12 @@ configure_switch() {
         return 1
     fi
 
-    # Set fail-mode to secure
-    # In secure mode, switch will drop all packets if controller is unreachable
-    echo -e "  → Setting fail-mode to secure"
-    if ovs-vsctl set-fail-mode "$switch" secure 2>/dev/null; then
-        echo -e "    ${GREEN}✓${NC} Fail-mode set to secure"
+    # Set fail-mode to standalone
+    # In standalone mode, switches forward traffic independently if controller is unreachable
+    # Prevents total network blackout on controller failure
+    echo -e "  → Setting fail-mode to standalone"
+    if ovs-vsctl set-fail-mode "$switch" standalone 2>/dev/null; then
+        echo -e "    ${GREEN}✓${NC} Fail-mode set to standalone"
     else
         echo -e "    ${RED}✗${NC} Failed to set fail-mode"
         return 1
@@ -206,7 +208,7 @@ display_summary() {
     echo ""
     echo "Controller Address:    ${CONTROLLER_ADDR}"
     echo "OpenFlow Protocol:     OpenFlow13"
-    echo "Fail-mode:             secure"
+    echo "Fail-mode:             standalone"
     echo "Statistics:            Enabled"
     echo ""
     echo "Switches configured:"

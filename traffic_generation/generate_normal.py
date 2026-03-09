@@ -37,6 +37,7 @@ import argparse
 import subprocess
 import signal
 import sys
+import atexit
 
 
 # Host configuration matching network_topology/topology.py
@@ -45,6 +46,9 @@ HOST_IPS = [f'10.0.0.{i}' for i in range(1, 11)]   # 10.0.0.1-10
 
 # Track PIDs of background processes for reliable cleanup
 _background_pids = []
+
+# Single HTTP server instance to prevent process leak
+_http_server_proc = None
 
 # Web server host (used for HTTP traffic)
 WEB_SERVER_HOST = 'h1'
@@ -119,10 +123,10 @@ def get_random_host_pair():
 
 def run_command(cmd, verbose=False):
     """
-    Execute a shell command and return success status.
+    Execute a command and return success status.
 
     Args:
-        cmd (str): Shell command to execute.
+        cmd (list): Command as a list of arguments (no shell=True).
         verbose (bool): If True, print the command before executing.
 
     Returns:
@@ -134,7 +138,6 @@ def run_command(cmd, verbose=False):
     try:
         result = subprocess.run(
             cmd,
-            shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=120  # 2-minute timeout to prevent hanging
@@ -142,16 +145,16 @@ def run_command(cmd, verbose=False):
         return result.returncode == 0
     except subprocess.TimeoutExpired:
         return False
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return False
 
 
 def start_background(cmd, verbose=False):
     """
-    Start a shell command as a background process and track its PID.
+    Start a command as a background process and track its PID.
 
     Args:
-        cmd (str): Shell command to execute in the background.
+        cmd (list): Command as a list of arguments (no shell=True).
         verbose (bool): If True, print the command being executed.
 
     Returns:
@@ -163,13 +166,12 @@ def start_background(cmd, verbose=False):
     try:
         proc = subprocess.Popen(
             cmd,
-            shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
         _background_pids.append(proc.pid)
         return proc
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return None
 
 
@@ -192,7 +194,7 @@ def generate_icmp_traffic(verbose=False):
     if verbose:
         print(f"  [ICMP] {src_ip} -> {dst_ip} ({ping_count} pings)")
 
-    cmd = f"ping -c {ping_count} -W 1 {dst_ip}"
+    cmd = ["ping", "-c", str(ping_count), "-W", "1", dst_ip]
     return run_command(cmd, verbose)
 
 
@@ -219,13 +221,13 @@ def generate_tcp_traffic(verbose=False):
         print(f"  [TCP]  {src_ip} -> {dst_ip} (iperf, {duration}s)")
 
     # Start iperf server on destination (background, tracked for cleanup)
-    server_proc = start_background("iperf -s -p 5001", verbose=False)
+    server_proc = start_background(["iperf", "-s", "-p", "5001"], verbose=False)
 
     # Small delay to let server start
     time.sleep(0.5)
 
     # Run iperf client
-    client_cmd = f"iperf -c {dst_ip} -p 5001 -t {duration}"
+    client_cmd = ["iperf", "-c", dst_ip, "-p", "5001", "-t", str(duration)]
     success = run_command(client_cmd, verbose)
 
     # Kill the specific iperf server we started
@@ -233,13 +235,56 @@ def generate_tcp_traffic(verbose=False):
         try:
             server_proc.terminate()
             server_proc.wait(timeout=5)
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             try:
                 server_proc.kill()
-            except Exception:
+            except (subprocess.SubprocessError, OSError):
                 pass
 
     return success
+
+
+def _ensure_http_server(verbose=False):
+    """
+    Start the HTTP server once and reuse it to prevent process leak.
+
+    Only starts a new server if one isn't already running. Registers
+    cleanup via atexit to ensure the server is terminated on exit.
+    """
+    global _http_server_proc
+
+    # Already running and alive
+    if _http_server_proc is not None and _http_server_proc.poll() is None:
+        return
+
+    server_cmd = [
+        "python3", "-m", "http.server",
+        str(WEB_SERVER_PORT), "--directory", "/tmp"
+    ]
+    _http_server_proc = start_background(server_cmd, verbose=verbose)
+
+    # Brief startup delay only on first launch
+    if _http_server_proc is not None:
+        time.sleep(0.5)
+
+
+def _cleanup_http_server():
+    """Terminate the HTTP server process if running."""
+    global _http_server_proc
+    if _http_server_proc is not None:
+        try:
+            _http_server_proc.terminate()
+            _http_server_proc.wait(timeout=5)
+        except (subprocess.SubprocessError, OSError):
+            try:
+                _http_server_proc.kill()
+            except (subprocess.SubprocessError, OSError):
+                pass
+        _http_server_proc = None
+
+
+# Register HTTP server cleanup at interpreter exit
+atexit.register(_cleanup_http_server)
 
 
 def generate_http_traffic(verbose=False):
@@ -247,8 +292,8 @@ def generate_http_traffic(verbose=False):
     Generate HTTP traffic by making wget requests to h1 (web server).
 
     Simulates web browsing by downloading small files from h1 acting as
-    an HTTP server. A Python HTTP server is started on h1 if not already
-    running.
+    an HTTP server. A single Python HTTP server is started on h1 and
+    reused across calls.
 
     Args:
         verbose (bool): If True, print detailed command information.
@@ -262,21 +307,15 @@ def generate_http_traffic(verbose=False):
     if verbose:
         print(f"  [HTTP] {client_ip} -> {WEB_SERVER_IP}:{WEB_SERVER_PORT}")
 
-    # Start a simple HTTP server on h1 if not already running
-    server_cmd = (
-        f"python3 -m http.server {WEB_SERVER_PORT} "
-        f"--directory /tmp"
-    )
-    start_background(server_cmd, verbose=False)
-
-    # Small delay for server startup
-    time.sleep(0.3)
+    # Start HTTP server once, reuse across calls
+    _ensure_http_server(verbose=False)
 
     # Download from the server using wget
-    wget_cmd = (
-        f"wget -q -O /dev/null --timeout=10 --tries=1 "
-        f"http://{WEB_SERVER_IP}:{WEB_SERVER_PORT}/ 2>/dev/null"
-    )
+    wget_cmd = [
+        "wget", "-q", "-O", "/dev/null",
+        "--timeout=10", "--tries=1",
+        f"http://{WEB_SERVER_IP}:{WEB_SERVER_PORT}/"
+    ]
     return run_command(wget_cmd, verbose)
 
 
@@ -357,7 +396,7 @@ def generate_traffic(duration, verbose=False):
             else:
                 stats.errors += 1
 
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             stats.errors += 1
             if verbose:
                 print(f"  [ERROR] {traffic_type}: {e}")
@@ -415,10 +454,13 @@ def cleanup():
 
     _background_pids.clear()
 
+    # Terminate the shared HTTP server
+    _cleanup_http_server()
+
     # Fallback: pkill for any orphaned processes from previous runs
-    run_command("pkill -f 'iperf -s' 2>/dev/null", verbose=False)
+    run_command(["pkill", "-f", "iperf -s"], verbose=False)
     run_command(
-        f"pkill -f 'python3 -m http.server {WEB_SERVER_PORT}' 2>/dev/null",
+        ["pkill", "-f", f"python3 -m http.server {WEB_SERVER_PORT}"],
         verbose=False
     )
     print("  Cleanup complete")

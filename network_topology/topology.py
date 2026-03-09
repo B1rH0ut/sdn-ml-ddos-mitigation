@@ -34,6 +34,7 @@ from mininet.node import RemoteController, OVSSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 from mininet.link import TCLink
+import argparse
 import os
 import sys
 
@@ -65,12 +66,19 @@ class SpineLeafTopology(Topo):
         HOST_COUNT (int): Number of hosts (10).
     """
 
-    SPINE_COUNT = 2
-    LEAF_COUNT = 3
-    HOST_COUNT = 10
+    def __init__(self, spine_count=2, leaf_count=3, host_count=10):
+        """
+        Initialize the spine-leaf topology.
 
-    def __init__(self):
-        """Initialize the spine-leaf topology."""
+        Args:
+            spine_count (int): Number of spine switches (default: 2).
+            leaf_count (int): Number of leaf switches (default: 3).
+            host_count (int): Number of hosts (default: 10).
+        """
+        # Configurable via CLI args instead of hardcoded constants
+        self.SPINE_COUNT = spine_count
+        self.LEAF_COUNT = leaf_count
+        self.HOST_COUNT = host_count
         super(SpineLeafTopology, self).__init__()
 
     def build(self):
@@ -116,20 +124,17 @@ class SpineLeafTopology(Topo):
                 self.addLink(spine, leaf, bw=100, delay='5ms')
 
         # ===== CONNECT HOSTS TO LEAF SWITCHES =====
-        # Distribute 10 hosts across 3 leaf switches:
-        #   s3 (leaf 0): h1, h2, h3        → 3 hosts
-        #   s4 (leaf 1): h4, h5, h6, h7    → 4 hosts
-        #   s5 (leaf 2): h8, h9, h10       → 3 hosts
+        # Distribute hosts evenly across leaves algorithmically
         info('*** Connecting hosts to leaf switches\n')
-        host_distribution = [
-            (leaves[0], hosts[0:3]),    # s3 ← h1, h2, h3
-            (leaves[1], hosts[3:7]),    # s4 ← h4, h5, h6, h7
-            (leaves[2], hosts[7:10]),   # s5 ← h8, h9, h10
-        ]
-
-        for leaf, leaf_hosts in host_distribution:
-            for host in leaf_hosts:
+        hosts_per_leaf = self.HOST_COUNT // self.LEAF_COUNT
+        remainder = self.HOST_COUNT % self.LEAF_COUNT
+        idx = 0
+        for i, leaf in enumerate(leaves):
+            # Distribute remainder hosts to the first 'remainder' leaves
+            count = hosts_per_leaf + (1 if i < remainder else 0)
+            for host in hosts[idx:idx + count]:
                 self.addLink(host, leaf, bw=100, delay='5ms')
+            idx += count
 
 
 def print_topology_info(net):
@@ -149,36 +154,23 @@ def print_topology_info(net):
     print("  Note:     Network will continue even if controller is not reachable")
 
     print("\n[SWITCHES]")
-    switches_info = [
-        ("s1", "Spine switch 1"),
-        ("s2", "Spine switch 2"),
-        ("s3", "Leaf switch 1 — hosts h1, h2, h3"),
-        ("s4", "Leaf switch 2 — hosts h4, h5, h6, h7"),
-        ("s5", "Leaf switch 3 — hosts h8, h9, h10"),
-    ]
-    for switch, description in switches_info:
-        print(f"  {switch}: {description}")
+    for switch in net.switches:
+        print(f"  {switch.name}: dpid={switch.dpid}")
 
     print("\n[HOSTS]")
-    for i in range(1, 11):
-        host = net.get(f'h{i}')
-        print(f"  h{i}: IP={host.IP()}, MAC={host.MAC()}")
+    for host in net.hosts:
+        print(f"  {host.name}: IP={host.IP()}, MAC={host.MAC()}")
 
-    print("\n[TOPOLOGY STRUCTURE]")
-    print("        s1 (spine)          s2 (spine)")
-    print("        /  |  \\            /  |  \\")
-    print("       /   |   \\          /   |   \\")
-    print("     s3    s4    s5      s3   s4    s5")
-    print("   (leaf) (leaf) (leaf)")
-    print("    /|\\   /||\\   /|\\")
-    print("  h1-h3  h4-h7  h8-h10")
+    num_switches = len(net.switches)
+    num_hosts = len(net.hosts)
+    num_links = len(net.links)
 
     print("\n[LINK SPECIFICATIONS]")
     print("  Bandwidth:       100 Mbps")
     print("  Delay:           5 ms")
-    print("  Spine-leaf:      6 links (full mesh)")
-    print("  Host-leaf:       10 links")
-    print("  Total:           16 links")
+    print(f"  Total switches:  {num_switches}")
+    print(f"  Total hosts:     {num_hosts}")
+    print(f"  Total links:     {num_links}")
 
     print("\n[SPINE-LEAF PROPERTIES]")
     print("  Every leaf connects to every spine (full bipartite mesh)")
@@ -197,27 +189,23 @@ def print_topology_info(net):
     print("\n" + "=" * 70 + "\n")
 
 
-def create_network():
+def create_network(spine_count=2, leaf_count=3, host_count=10):
     """
     Create and start the Mininet network.
 
-    This function:
-    1. Cleans up any previous Mininet state
-    2. Creates the spine-leaf topology
-    3. Initializes network with remote controller
-    4. Starts the network
-    5. Displays topology information
-    6. Enters Mininet CLI
-    7. Cleans up on exit
+    Args:
+        spine_count (int): Number of spine switches.
+        leaf_count (int): Number of leaf switches.
+        host_count (int): Number of hosts.
     """
 
     # Clean up any previous Mininet state
     info('*** Cleaning up previous Mininet state\n')
     os.system('mn -c > /dev/null 2>&1')
 
-    # Create topology instance
+    # Create topology instance with configurable parameters
     info('*** Creating topology\n')
-    topo = SpineLeafTopology()
+    topo = SpineLeafTopology(spine_count, leaf_count, host_count)
 
     # Create network with remote controller
     # Controller is expected at 127.0.0.1:6653 (default Ryu controller port)
@@ -238,6 +226,22 @@ def create_network():
     info('*** Starting network\n')
     net.start()
 
+    # Enable STP on all switches to prevent broadcast loops.
+    # The spine-leaf topology has multiple paths between leaves via spines.
+    # Without STP, broadcast/flood frames loop infinitely between switches.
+    info('*** Enabling STP on all switches for loop prevention\n')
+    for switch in net.switches:
+        switch_name = switch.name
+        # Enable STP on the OVS bridge
+        os.system(f'ovs-vsctl set bridge {switch_name} stp_enable=true')
+        info(f'  STP enabled on {switch_name}\n')
+
+    # Allow time for STP convergence (ports move through
+    # listening -> learning -> forwarding states)
+    info('*** Waiting for STP convergence (15 seconds)...\n')
+    import time
+    time.sleep(15)
+
     info('*** Network started successfully!\n')
 
     # Print detailed topology information
@@ -256,8 +260,8 @@ def main():
     """
     Main function to run the network topology.
 
-    Checks for root privileges, sets log level, and creates the network
-    with proper error handling.
+    Checks for root privileges, parses CLI args, sets log level, and
+    creates the network with proper error handling.
     """
 
     # Check if script is run as root (required for Mininet)
@@ -266,12 +270,28 @@ def main():
         print("Usage: sudo python3 topology.py")
         sys.exit(1)
 
+    # Parse topology parameters from CLI
+    parser = argparse.ArgumentParser(
+        description='Create SDN spine-leaf network topology in Mininet'
+    )
+    parser.add_argument('--spines', type=int, default=2,
+                        help='Number of spine switches (default: 2)')
+    parser.add_argument('--leaves', type=int, default=3,
+                        help='Number of leaf switches (default: 3)')
+    parser.add_argument('--hosts', type=int, default=10,
+                        help='Number of hosts (default: 10)')
+    args = parser.parse_args()
+
+    if args.spines < 1 or args.leaves < 1 or args.hosts < 1:
+        print("ERROR: All topology parameters must be >= 1")
+        sys.exit(1)
+
     # Set Mininet log level to info
     setLogLevel('info')
 
     try:
         # Create and run the network
-        create_network()
+        create_network(args.spines, args.leaves, args.hosts)
 
     except KeyboardInterrupt:
         # Handle Ctrl+C gracefully

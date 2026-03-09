@@ -4,7 +4,10 @@ Full Dataset Generator for DDoS Detection Model Training
 
 Generates a realistic synthetic dataset of network flow statistics for
 training the Random Forest DDoS detection classifier. Produces flows
-with realistic value distributions across six traffic categories:
+with realistic value distributions across six traffic categories.
+
+Feature definitions are imported from utilities/feature_extractor.py
+(the single source of truth).
 
 Normal Traffic (65%):
     - ICMP (ping):  Low packet rates, small payloads
@@ -13,13 +16,15 @@ Normal Traffic (65%):
 
 Attack Traffic (35%):
     - ICMP Flood:   Extremely high ICMP packet rates
-    - SYN Flood:    High TCP SYN rates to port 80
-    - UDP Flood:    High UDP packet rates to port 53
+    - SYN Flood:    High TCP SYN rates (tiny packets)
+    - UDP Flood:    High UDP packet rates
 
-Output CSV columns (11 total):
-    flow_duration_sec, idle_timeout, hard_timeout, packet_count,
-    byte_count, packet_count_per_second, byte_count_per_second,
-    ip_proto, icmp_code, icmp_type, label
+Output CSV columns (13 total = 12 features + 1 label):
+    flow_duration_sec, packet_count, byte_count,
+    packet_count_per_second, byte_count_per_second, avg_packet_size,
+    ip_proto, icmp_code, icmp_type,
+    flows_to_dst, unique_sources_to_dst, flow_creation_rate,
+    label
 
 Usage:
     python3 generate_full_dataset.py
@@ -35,6 +40,10 @@ import argparse
 import os
 import sys
 
+# Import feature definitions from the single source of truth
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from utilities.feature_extractor import CSV_HEADERS, FEATURE_NAMES, EXPECTED_FEATURE_COUNT
+
 # Attempt to import tqdm for progress bar; fall back gracefully
 try:
     from tqdm import tqdm
@@ -45,31 +54,7 @@ except ImportError:
     print("  Continuing without progress bar...\n")
 
 
-# CSV column headers — must match train_model.py and mitigation_module.py
-CSV_HEADERS = [
-    'flow_duration_sec',
-    'idle_timeout',
-    'hard_timeout',
-    'packet_count',
-    'byte_count',
-    'packet_count_per_second',
-    'byte_count_per_second',
-    'ip_proto',
-    'icmp_code',
-    'icmp_type',
-    'label'
-]
-
 # Traffic distribution within normal and attack categories
-# Normal: 65% of total dataset
-#   - ICMP ping:  30% of normal
-#   - TCP data:   50% of normal
-#   - HTTP web:   20% of normal
-# Attack: 35% of total dataset
-#   - ICMP Flood: 33.3% of attack
-#   - SYN Flood:  33.3% of attack
-#   - UDP Flood:  33.4% of attack
-
 NORMAL_RATIO = 0.65
 ATTACK_RATIO = 0.35
 
@@ -90,13 +75,9 @@ def add_noise(value, noise_pct=0.05):
     """
     Add small random noise to a value for realism.
 
-    Applies gaussian noise scaled to a percentage of the value,
-    ensuring the result is never negative.
-
     Args:
         value (float): Base value to add noise to.
-        noise_pct (float): Maximum noise as fraction of value
-            (default: 5%).
+        noise_pct (float): Maximum noise as fraction of value (default: 5%).
 
     Returns:
         float: Value with noise applied, clamped to >= 0.
@@ -105,233 +86,170 @@ def add_noise(value, noise_pct=0.05):
     return max(0, value + noise)
 
 
-def generate_icmp_ping():
+def _build_flow(duration, packet_count, byte_count, ip_proto, icmp_code,
+                icmp_type, flows_to_dst, unique_sources_to_dst,
+                flow_creation_rate):
     """
-    Generate a single normal ICMP ping flow.
+    Build a 12-feature row from raw values.
 
-    Simulates a standard ping session with low packet counts,
-    small payloads, and low packet rates.
+    Computes derived features (pps, bps, avg_packet_size) from base values.
 
     Returns:
-        list: 10 feature values representing a normal ICMP flow.
+        list: 12 feature values in FEATURE_NAMES order.
     """
+    # Rates
+    if duration > 0:
+        pps = packet_count / duration
+        bps = byte_count / duration
+    else:
+        pps = packet_count
+        bps = byte_count
+
+    # Average packet size (proxy for TCP flag behavior)
+    if packet_count > 0:
+        avg_pkt_size = byte_count / packet_count
+    else:
+        avg_pkt_size = 0
+
+    return [
+        round(add_noise(duration), 4),
+        int(add_noise(packet_count)),
+        int(add_noise(byte_count)),
+        round(add_noise(pps), 4),
+        round(add_noise(bps), 4),
+        round(add_noise(avg_pkt_size), 4),
+        ip_proto,
+        icmp_code,
+        icmp_type,
+        int(add_noise(flows_to_dst)),
+        int(add_noise(unique_sources_to_dst)),
+        round(add_noise(flow_creation_rate), 4),
+    ]
+
+
+# =============================================================================
+# Normal traffic generators
+# =============================================================================
+
+def generate_icmp_ping():
+    """Generate a single normal ICMP ping flow (12 features)."""
     duration = random.uniform(0.5, 10.0)
-    idle_timeout = random.choice([10, 15, 20, 30])
-    hard_timeout = random.choice([30, 60])
     packet_count = random.randint(5, 50)
     byte_count = random.randint(500, 5000)
 
-    # Calculate rates from counts and duration
-    pps = packet_count / duration if duration > 0 else packet_count
-    bps = byte_count / duration if duration > 0 else byte_count
+    # Normal aggregate behavior: few flows, few sources
+    flows_to_dst = random.randint(1, 8)
+    unique_sources = random.randint(1, 4)
+    flow_rate = random.uniform(0.1, 1.0)
 
-    # ICMP protocol fields
-    ip_proto = 1       # ICMP
-    icmp_code = 0      # No error code for echo
-    icmp_type = 8      # Echo request
-
-    return [
-        round(add_noise(duration), 4),
-        idle_timeout,
-        hard_timeout,
-        int(add_noise(packet_count)),
-        int(add_noise(byte_count)),
-        round(add_noise(pps), 4),
-        round(add_noise(bps), 4),
-        ip_proto,
-        icmp_code,
-        icmp_type,
-    ]
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=1, icmp_code=0, icmp_type=8,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
 
 
 def generate_tcp_data():
-    """
-    Generate a single normal TCP data transfer flow.
-
-    Simulates file transfers, database queries, and general TCP
-    communication with moderate-to-high duration and packet counts.
-
-    Returns:
-        list: 10 feature values representing a normal TCP flow.
-    """
+    """Generate a single normal TCP data transfer flow (12 features)."""
     duration = random.uniform(1.0, 300.0)
-    idle_timeout = random.choice([10, 15, 30, 60])
-    hard_timeout = random.choice([30, 60, 120, 300])
     packet_count = random.randint(50, 5000)
     byte_count = random.randint(5000, 500000)
 
-    pps = packet_count / duration if duration > 0 else packet_count
-    bps = byte_count / duration if duration > 0 else byte_count
+    flows_to_dst = random.randint(1, 15)
+    unique_sources = random.randint(1, 8)
+    flow_rate = random.uniform(0.1, 2.0)
 
-    # TCP protocol fields
-    ip_proto = 6       # TCP
-    icmp_code = 0      # Not applicable for TCP
-    icmp_type = 0      # Not applicable for TCP
-
-    return [
-        round(add_noise(duration), 4),
-        idle_timeout,
-        hard_timeout,
-        int(add_noise(packet_count)),
-        int(add_noise(byte_count)),
-        round(add_noise(pps), 4),
-        round(add_noise(bps), 4),
-        ip_proto,
-        icmp_code,
-        icmp_type,
-    ]
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=6, icmp_code=0, icmp_type=0,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
 
 
 def generate_http_web():
-    """
-    Generate a single normal HTTP web browsing flow.
-
-    Simulates short web page requests with quick response times,
-    small-to-medium payloads, and moderate packet rates.
-
-    Returns:
-        list: 10 feature values representing a normal HTTP flow.
-    """
+    """Generate a single normal HTTP web browsing flow (12 features)."""
     duration = random.uniform(0.1, 5.0)
-    idle_timeout = random.choice([5, 10, 15])
-    hard_timeout = random.choice([10, 20, 30])
     packet_count = random.randint(10, 200)
     byte_count = random.randint(1000, 100000)
 
-    pps = packet_count / duration if duration > 0 else packet_count
-    bps = byte_count / duration if duration > 0 else byte_count
+    flows_to_dst = random.randint(1, 20)
+    unique_sources = random.randint(1, 10)
+    flow_rate = random.uniform(0.2, 3.0)
 
-    # HTTP uses TCP
-    ip_proto = 6       # TCP
-    icmp_code = 0
-    icmp_type = 0
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=6, icmp_code=0, icmp_type=0,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
 
-    return [
-        round(add_noise(duration), 4),
-        idle_timeout,
-        hard_timeout,
-        int(add_noise(packet_count)),
-        int(add_noise(byte_count)),
-        round(add_noise(pps), 4),
-        round(add_noise(bps), 4),
-        ip_proto,
-        icmp_code,
-        icmp_type,
-    ]
 
+# =============================================================================
+# Attack traffic generators
+# =============================================================================
 
 def generate_icmp_flood():
-    """
-    Generate a single ICMP Flood attack flow.
-
-    Simulates an ICMP flood DDoS attack with extremely high packet
-    rates (>10,000 pps), large byte counts, and short durations.
-
-    Returns:
-        list: 10 feature values representing an ICMP flood attack.
-    """
+    """Generate a single ICMP Flood attack flow (12 features)."""
     duration = random.uniform(0.1, 5.0)
-    idle_timeout = random.choice([0, 5])
-    hard_timeout = random.choice([0, 10])
     packet_count = random.randint(10000, 100000)
     byte_count = random.randint(500000, 5000000)
 
-    pps = packet_count / duration if duration > 0 else packet_count
-    bps = byte_count / duration if duration > 0 else byte_count
+    # Attack aggregate behavior: many flows, many sources targeting same dst
+    flows_to_dst = random.randint(50, 500)
+    unique_sources = random.randint(20, 200)
+    flow_rate = random.uniform(10.0, 100.0)
 
-    # ICMP protocol fields
-    ip_proto = 1       # ICMP
-    icmp_code = 0
-    icmp_type = 8      # Echo request (flood)
-
-    return [
-        round(add_noise(duration), 4),
-        idle_timeout,
-        hard_timeout,
-        int(add_noise(packet_count)),
-        int(add_noise(byte_count)),
-        round(add_noise(pps), 4),
-        round(add_noise(bps), 4),
-        ip_proto,
-        icmp_code,
-        icmp_type,
-    ]
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=1, icmp_code=0, icmp_type=8,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
 
 
 def generate_syn_flood():
-    """
-    Generate a single SYN Flood attack flow.
-
-    Simulates a TCP SYN flood DDoS attack targeting port 80 with
-    high packet rates (>5,000 pps) and randomized source IPs.
-
-    Returns:
-        list: 10 feature values representing a SYN flood attack.
-    """
+    """Generate a single SYN Flood attack flow (12 features)."""
     duration = random.uniform(0.1, 10.0)
-    idle_timeout = random.choice([0, 5])
-    hard_timeout = random.choice([0, 10])
     packet_count = random.randint(5000, 80000)
-    byte_count = random.randint(300000, 4000000)
+    # SYN floods have tiny packets (~60 bytes each)
+    byte_count = random.randint(packet_count * 40, packet_count * 80)
 
-    pps = packet_count / duration if duration > 0 else packet_count
-    bps = byte_count / duration if duration > 0 else byte_count
+    flows_to_dst = random.randint(80, 600)
+    unique_sources = random.randint(30, 300)
+    flow_rate = random.uniform(15.0, 120.0)
 
-    # TCP SYN protocol fields
-    ip_proto = 6       # TCP
-    icmp_code = 0      # Not applicable for TCP
-    icmp_type = 0      # Not applicable for TCP
-
-    return [
-        round(add_noise(duration), 4),
-        idle_timeout,
-        hard_timeout,
-        int(add_noise(packet_count)),
-        int(add_noise(byte_count)),
-        round(add_noise(pps), 4),
-        round(add_noise(bps), 4),
-        ip_proto,
-        icmp_code,
-        icmp_type,
-    ]
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=6, icmp_code=0, icmp_type=0,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
 
 
 def generate_udp_flood():
-    """
-    Generate a single UDP Flood attack flow.
-
-    Simulates a UDP flood DDoS attack targeting port 53 (DNS) with
-    high packet rates (>8,000 pps) and large byte volumes.
-
-    Returns:
-        list: 10 feature values representing a UDP flood attack.
-    """
+    """Generate a single UDP Flood attack flow (12 features)."""
     duration = random.uniform(0.1, 8.0)
-    idle_timeout = random.choice([0, 5])
-    hard_timeout = random.choice([0, 10])
     packet_count = random.randint(8000, 90000)
     byte_count = random.randint(400000, 4500000)
 
-    pps = packet_count / duration if duration > 0 else packet_count
-    bps = byte_count / duration if duration > 0 else byte_count
+    flows_to_dst = random.randint(60, 450)
+    unique_sources = random.randint(25, 250)
+    flow_rate = random.uniform(12.0, 90.0)
 
-    # UDP protocol fields
-    ip_proto = 17      # UDP
-    icmp_code = 0      # Not applicable for UDP
-    icmp_type = 0      # Not applicable for UDP
-
-    return [
-        round(add_noise(duration), 4),
-        idle_timeout,
-        hard_timeout,
-        int(add_noise(packet_count)),
-        int(add_noise(byte_count)),
-        round(add_noise(pps), 4),
-        round(add_noise(bps), 4),
-        ip_proto,
-        icmp_code,
-        icmp_type,
-    ]
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=17, icmp_code=0, icmp_type=0,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
 
 
 # Generator function mapping for each traffic subtype
@@ -350,24 +268,22 @@ def generate_dataset(total_flows, seed=42):
     Generate the complete synthetic flow dataset.
 
     Creates a balanced dataset with 65% normal and 35% attack flows,
-    distributed across six traffic subtypes. Each flow has 10 features
-    plus a label column.
+    distributed across six traffic subtypes. Each flow has 12 features
+    plus a label column (13 columns total).
 
     Args:
         total_flows (int): Total number of flows to generate.
         seed (int): Random seed for reproducibility (default: 42).
 
     Returns:
-        pandas.DataFrame: DataFrame with 11 columns (10 features + label),
+        pandas.DataFrame: DataFrame with 13 columns (12 features + label),
             shuffled randomly.
     """
-    # Set random seeds for reproducibility
     random.seed(seed)
     np.random.seed(seed)
 
-    # Calculate flow counts per category
     normal_total = int(total_flows * NORMAL_RATIO)
-    attack_total = total_flows - normal_total  # Remainder goes to attack
+    attack_total = total_flows - normal_total
 
     # Calculate counts per subtype
     normal_counts = {}
@@ -375,7 +291,6 @@ def generate_dataset(total_flows, seed=42):
     subtypes = list(NORMAL_SUBTYPES.items())
     for i, (subtype, ratio) in enumerate(subtypes):
         if i == len(subtypes) - 1:
-            # Last subtype gets the remainder to avoid rounding errors
             normal_counts[subtype] = normal_total - allocated
         else:
             count = int(normal_total * ratio)
@@ -396,6 +311,7 @@ def generate_dataset(total_flows, seed=42):
     # Print generation plan
     print("\n  Generation Plan:")
     print(f"    Total flows:      {total_flows}")
+    print(f"    Features:         {EXPECTED_FEATURE_COUNT}")
     print(f"    Normal flows:     {normal_total} ({NORMAL_RATIO * 100:.0f}%)")
     for subtype, count in normal_counts.items():
         print(f"      {subtype:15s} {count:>8,}")
@@ -404,7 +320,7 @@ def generate_dataset(total_flows, seed=42):
         print(f"      {subtype:15s} {count:>8,}")
     print()
 
-    # Build task list: [(generator_func, label, count), ...]
+    # Build task list
     tasks = []
     for subtype, count in normal_counts.items():
         tasks.append((GENERATORS[subtype], 0, count, subtype))
@@ -415,7 +331,6 @@ def generate_dataset(total_flows, seed=42):
     rows = []
     total_generated = 0
 
-    # Create progress iterator
     if HAS_TQDM:
         progress = tqdm(total=total_flows, desc="  Generating flows", unit="flow")
     else:
@@ -430,7 +345,6 @@ def generate_dataset(total_flows, seed=42):
             if progress:
                 progress.update(1)
             elif total_generated % 10000 == 0:
-                # Fallback progress without tqdm
                 pct = (total_generated / total_flows) * 100
                 print(f"  Progress: {total_generated:,}/{total_flows:,} "
                       f"({pct:.1f}%) - {subtype}")
@@ -438,11 +352,9 @@ def generate_dataset(total_flows, seed=42):
     if progress:
         progress.close()
 
-    # Create DataFrame
     print("\n  Creating DataFrame...")
     df = pd.DataFrame(rows, columns=CSV_HEADERS)
 
-    # Shuffle the dataset to mix normal and attack flows
     print("  Shuffling dataset...")
     df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
 
@@ -453,9 +365,6 @@ def validate_dataset(df):
     """
     Validate the generated dataset for correctness.
 
-    Checks for NaN values, Inf values, correct column count,
-    valid labels, and expected class distribution.
-
     Args:
         df (pandas.DataFrame): Generated dataset to validate.
 
@@ -465,21 +374,19 @@ def validate_dataset(df):
     print("\n  Validating dataset...")
     passed = True
 
-    # Check column count
-    if len(df.columns) != 11:
-        print(f"    FAIL: Expected 11 columns, got {len(df.columns)}")
+    expected_cols = len(CSV_HEADERS)  # 13
+    if len(df.columns) != expected_cols:
+        print(f"    FAIL: Expected {expected_cols} columns, got {len(df.columns)}")
         passed = False
     else:
         print(f"    OK: Column count = {len(df.columns)}")
 
-    # Check column names
     if list(df.columns) != CSV_HEADERS:
         print(f"    FAIL: Column names don't match expected headers")
         passed = False
     else:
         print(f"    OK: Column names match")
 
-    # Check for NaN values
     nan_count = df.isnull().sum().sum()
     if nan_count > 0:
         print(f"    FAIL: Found {nan_count} NaN values")
@@ -487,8 +394,7 @@ def validate_dataset(df):
     else:
         print(f"    OK: No NaN values")
 
-    # Check for Inf values
-    feature_cols = CSV_HEADERS[:10]
+    feature_cols = FEATURE_NAMES
     inf_count = np.isinf(df[feature_cols].values).sum()
     if inf_count > 0:
         print(f"    FAIL: Found {inf_count} Inf values")
@@ -496,7 +402,6 @@ def validate_dataset(df):
     else:
         print(f"    OK: No Inf values")
 
-    # Check labels are only 0 and 1
     unique_labels = set(df['label'].unique())
     if unique_labels != {0, 1}:
         print(f"    FAIL: Unexpected labels: {unique_labels}")
@@ -504,22 +409,17 @@ def validate_dataset(df):
     else:
         print(f"    OK: Labels are {{0, 1}}")
 
-    # Check class distribution
     normal_pct = (df['label'] == 0).mean() * 100
     attack_pct = (df['label'] == 1).mean() * 100
     if abs(normal_pct - 65.0) > 1.0:
-        print(f"    WARN: Normal ratio {normal_pct:.1f}% "
-              f"(expected ~65%)")
+        print(f"    WARN: Normal ratio {normal_pct:.1f}% (expected ~65%)")
     else:
         print(f"    OK: Normal ratio = {normal_pct:.1f}%")
-
     if abs(attack_pct - 35.0) > 1.0:
-        print(f"    WARN: Attack ratio {attack_pct:.1f}% "
-              f"(expected ~35%)")
+        print(f"    WARN: Attack ratio {attack_pct:.1f}% (expected ~35%)")
     else:
         print(f"    OK: Attack ratio = {attack_pct:.1f}%")
 
-    # Check no negative values in counts
     for col in ['packet_count', 'byte_count']:
         neg_count = (df[col] < 0).sum()
         if neg_count > 0:
@@ -540,7 +440,6 @@ def print_summary(df):
     print("  Dataset Summary Statistics")
     print("=" * 65)
 
-    # Overall counts
     total = len(df)
     normal = (df['label'] == 0).sum()
     attack = (df['label'] == 1).sum()
@@ -548,7 +447,6 @@ def print_summary(df):
     print(f"  Normal (0):     {normal:,} ({normal / total * 100:.1f}%)")
     print(f"  Attack (1):     {attack:,} ({attack / total * 100:.1f}%)")
 
-    # Protocol distribution
     print(f"\n  Protocol Distribution:")
     proto_map = {1: 'ICMP', 6: 'TCP', 17: 'UDP'}
     for proto_num, proto_name in proto_map.items():
@@ -557,8 +455,6 @@ def print_summary(df):
             print(f"    {proto_name} (proto={proto_num}): {count:,} "
                   f"({count / total * 100:.1f}%)")
 
-    # Feature statistics for normal vs attack
-    feature_cols = CSV_HEADERS[:10]
     print(f"\n  Feature Statistics (Normal vs Attack):")
     print(f"  {'Feature':<30s} {'Normal Mean':>14s} {'Attack Mean':>14s}")
     print(f"  {'-' * 30} {'-' * 14} {'-' * 14}")
@@ -566,15 +462,15 @@ def print_summary(df):
     normal_df = df[df['label'] == 0]
     attack_df = df[df['label'] == 1]
 
-    for col in feature_cols:
+    for col in FEATURE_NAMES:
         n_mean = normal_df[col].mean()
         a_mean = attack_df[col].mean()
         print(f"  {col:<30s} {n_mean:>14.2f} {a_mean:>14.2f}")
 
-    # Key differentiating features
     print(f"\n  Key Differentiators (Attack vs Normal ratio):")
     for col in ['packet_count_per_second', 'byte_count_per_second',
-                'packet_count', 'byte_count']:
+                'avg_packet_size', 'flows_to_dst', 'unique_sources_to_dst',
+                'flow_creation_rate']:
         n_mean = normal_df[col].mean()
         a_mean = attack_df[col].mean()
         ratio = a_mean / n_mean if n_mean > 0 else float('inf')
@@ -582,76 +478,58 @@ def print_summary(df):
 
 
 def main():
-    """
-    Main entry point for dataset generation.
-
-    Parses command-line arguments, generates the dataset, validates it,
-    saves to CSV, and prints summary statistics.
-    """
+    """Main entry point for dataset generation."""
     parser = argparse.ArgumentParser(
         description='Generate synthetic flow dataset for DDoS detection'
     )
     parser.add_argument(
-        '--total',
-        type=int,
-        default=50000,
+        '--total', type=int, default=50000,
         help='Total number of flows to generate (default: 50000)'
     )
     parser.add_argument(
-        '--output',
-        type=str,
-        default=None,
+        '--output', type=str, default=None,
         help='Output CSV filename (default: flow_dataset.csv)'
     )
     parser.add_argument(
-        '--seed',
-        type=int,
-        default=42,
+        '--seed', type=int, default=42,
         help='Random seed for reproducibility (default: 42)'
     )
     args = parser.parse_args()
 
-    # Validate total
     if args.total <= 0:
         print("ERROR: Total must be a positive integer")
         sys.exit(1)
 
-    # Resolve output path relative to this script's directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.output:
         output_path = os.path.join(script_dir, args.output)
     else:
         output_path = os.path.join(script_dir, 'flow_dataset.csv')
 
-    # Print banner
     print("\n" + "=" * 65)
     print("  DDoS Detection - Synthetic Dataset Generator")
     print("=" * 65)
     print(f"  Total flows:  {args.total:,}")
+    print(f"  Features:     {EXPECTED_FEATURE_COUNT}")
     print(f"  Normal:       {int(args.total * NORMAL_RATIO):,} (65%)")
     print(f"  Attack:       {args.total - int(args.total * NORMAL_RATIO):,} (35%)")
     print(f"  Output:       {output_path}")
     print(f"  Seed:         {args.seed}")
 
-    # Generate dataset
     df = generate_dataset(args.total, seed=args.seed)
 
-    # Validate
     valid = validate_dataset(df)
     if not valid:
         print("\n  WARNING: Dataset validation found issues")
         print("  The dataset may still be usable but review the warnings above")
 
-    # Save to CSV
     print(f"\n  Saving to {output_path}...")
     df.to_csv(output_path, index=False)
     file_size = os.path.getsize(output_path) / (1024 * 1024)
     print(f"  File saved: {file_size:.2f} MB")
 
-    # Print summary
     print_summary(df)
 
-    # Final message
     print("\n" + "=" * 65)
     print("  Dataset generation complete!")
     print("=" * 65)

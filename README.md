@@ -12,29 +12,33 @@ An intelligent network security system that combines **Software-Defined Networki
                     ┌─────────────────────────────────┐
                     │       Application Layer         │
                     │    Random Forest Classifier     │
-                    │   10 flow features · Scaler     │
+                    │  12 flow features · Scaler ·    │
+                    │  Confidence threshold (0.7)     │
                     └───────────────┬─────────────────┘
-                                    │ predict()
+                                    │ predict_proba()
                     ┌───────────────▼─────────────────┐
                     │        Control Layer            │
                     │   Ryu SDN Controller (OF 1.3)   │
                     │  MAC learning · Stats polling   │
-                    │  Feature extraction · DROP rules│
+                    │  Rate limiting · Loop prevention│
+                    │  SHA-256 model verification     │
                     └───────────────┬─────────────────┘
                                     │ OpenFlow 1.3
                     ┌───────────────▼─────────────────┐
                     │         Data Layer              │
                     │   Mininet Spine-Leaf Topology   │
-                    │  5 switches · 10 hosts · 100Mbps│
+                    │  Configurable switches & hosts  │
+                    │  STP enabled · 100Mbps links    │
                     └─────────────────────────────────┘
 ```
 
-1. The **Ryu controller** manages a spine-leaf network of 5 OpenFlow switches and 10 hosts
-2. Every **5 seconds**, it collects flow statistics from all switches
-3. **10 features** are extracted from each flow (packet rates, byte counts, protocol fields)
-4. A trained **Random Forest model** classifies each flow as normal or attack
-5. Attacks trigger an automatic **DROP rule** (priority 32768, 300s timeout) on the switch
-6. All detections are **logged** to CSV for post-incident analysis
+1. The **Ryu controller** manages a spine-leaf network with STP-enabled OpenFlow switches
+2. Every **5 seconds** (configurable via `ryu.conf`), it collects flow statistics from all switches
+3. **12 features** are extracted per flow, including per-destination aggregate behavior
+4. Features are **batched** and classified by a **Random Forest model** using `predict_proba()`
+5. Flows exceeding the **confidence threshold** (default 0.7) trigger a specific **DROP rule** on the switch
+6. The controller verifies **SHA-256 model integrity** before loading to prevent tampering
+7. All detections are **logged** to CSV with sanitized inputs
 
 The controller gracefully degrades to a standard L2 switch if the ML model is not loaded.
 
@@ -43,29 +47,36 @@ The controller gracefully degrades to a standard L2 switch if the ML model is no
 ## Detection Pipeline
 
 ```
-Flow Stats Request (every 5s)
+Flow Stats Reply
         │
         ▼
-┌──────────────────┐     ┌───────────────┐     ┌──────────────┐     ┌───────────────┐
-│ Extract Features │ ──▶ │ Scale (σ, μ)  │ ──▶ │  RF Predict  │ ──▶ │ DROP / Allow  │
-│   10 per flow    │     │ StandardScaler│     │  0=ok 1=ddos │     │ + Log to CSV  │
-└──────────────────┘     └───────────────┘     └──────────────┘     └───────────────┘
+┌──────────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────────┐    ┌──────────────┐
+│ Filter & Map │──▶ │ Aggregate    │──▶ │ Batch Scale   │──▶ │ RF Predict   │──▶ │ DROP / Allow │
+│  IPv4 flows  │    │ per-dst stats│    │ StandardScaler│    │ predict_proba│    │ + Log to CSV │
+│  + sampling  │    │ 12 features  │    │  (σ, μ)       │    │ threshold≥0.7│    │ + syslog     │
+└──────────────┘    └──────────────┘    └───────────────┘    └──────────────┘    └──────────────┘
 ```
 
-**Features extracted per flow:**
+**Features extracted per flow (12):**
 
-| # | Feature                   | Description                       |
-|---|---------------------------|-----------------------------------|
-| 1 | `flow_duration_sec`       | How long the flow has been active |
-| 2 | `idle_timeout`            | Configured idle expiry            |
-| 3 | `hard_timeout`            | Configured hard expiry            |
-| 4 | `packet_count`            | Total packets in flow             |
-| 5 | `byte_count`              | Total bytes in flow               |
-| 6 | `packet_count_per_second` | Packet rate                       |
-| 7 | `byte_count_per_second`   | Byte rate                         |
-| 8 | `ip_proto`                | IP protocol number (1/6/17)       |
-| 9 | `icmp_code`               | ICMP code field                   |
-| 10 | `icmp_type`              | ICMP type field                   |
+| # | Feature                   | Description                                  |
+|---|---------------------------|----------------------------------------------|
+| 1 | `flow_duration_sec`       | How long the flow has been active            |
+| 2 | `packet_count`            | Total packets in flow                        |
+| 3 | `byte_count`              | Total bytes in flow                          |
+| 4 | `packet_count_per_second` | Packet rate                                  |
+| 5 | `byte_count_per_second`   | Byte rate                                    |
+| 6 | `avg_packet_size`         | Average bytes per packet                     |
+| 7 | `ip_proto`                | IP protocol number (1=ICMP, 6=TCP, 17=UDP)  |
+| 8 | `icmp_code`               | ICMP code field                              |
+| 9 | `icmp_type`               | ICMP type field                              |
+| 10 | `flows_to_dst`           | Number of flows targeting same destination   |
+| 11 | `unique_sources_to_dst`  | Unique source IPs targeting same destination |
+| 12 | `flow_creation_rate`     | New flows per second to same destination     |
+
+Features 10–12 are **aggregate behavior features** that capture DDoS patterns invisible at the individual flow level (e.g., many sources flooding one target).
+
+All feature definitions live in `utilities/feature_extractor.py` — the single source of truth imported by every module.
 
 ---
 
@@ -83,10 +94,33 @@ Flow Stats Request (every 5s)
               h7
 ```
 
-- **5 OpenFlow 1.3 switches** in a 2-tier spine-leaf (Clos) architecture
-- **Full mesh** between tiers — every leaf connects to every spine (6 inter-switch links)
-- **10 hosts** (10.0.0.1–10, /24) distributed across 3 leaf switches
-- **100 Mbps** links with **5 ms** delay on all connections
+- **5 OpenFlow 1.3 switches** in a 2-tier spine-leaf (Clos) architecture (default; configurable)
+- **Full mesh** between tiers — every leaf connects to every spine
+- **10 hosts** (10.0.0.1–10, /24) distributed across leaf switches (default; configurable)
+- **100 Mbps** links with **5 ms** delay
+- **STP enabled** on all switches for loop prevention (15s convergence wait)
+- **Configurable** via CLI: `sudo python3 topology.py --spines 4 --leaves 6 --hosts 50`
+
+---
+
+## Security Features
+
+| Feature | Description |
+|---------|-------------|
+| SHA-256 model verification | Validates `.pkl` integrity before loading (prevents pickle RCE) |
+| PacketIn rate limiting | Per-switch throttling prevents controller DoS |
+| Flood rate limiting | Per-switch broadcast caps prevent amplification |
+| Broadcast loop suppression | Duplicate flood tracking + STP on all switches |
+| MAC table aging | Entries auto-expire after 300s to prevent unbounded growth |
+| Port security | Maximum 5 MACs per port per switch |
+| ML confidence threshold | Only blocks flows with attack probability above 0.7 |
+| Specific DROP rules | Matches `(src_ip, dst_ip, ip_proto)` tuples, not entire source IPs |
+| Randomized block timeouts | ±20% variation prevents predictable attack windows |
+| CSV log sanitization | IP validation prevents injection in attack logs |
+| Localhost-only bindings | OpenFlow and REST API bound to `127.0.0.1` |
+| Graceful shutdown | SIGTERM/SIGINT handlers persist state before exit |
+| Thread-safe shared state | Explicit locks on all shared data structures |
+| Concept drift detection | Monitors prediction distribution shifts over time |
 
 ---
 
@@ -94,11 +128,11 @@ Flow Stats Request (every 5s)
 
 ### Model Training
 
-Running `python3 train_model.py` produces output like:
+Running `python3 train_model.py` produces:
 
 ```
 ======================================================================
-  STEP 5: Evaluating Model Performance
+  STEP 5: Evaluating Model Performance (holdout test set)
 ======================================================================
 
   Accuracy:      0.XXXX (XX.X%)
@@ -116,42 +150,54 @@ Running `python3 train_model.py` produces output like:
   Feature Importance (top contributors):
     packet_count_per_second        0.XXXX ##############
     byte_count_per_second          0.XXXX ###########
-    packet_count                   0.XXXX ########
+    flows_to_dst                   0.XXXX ########
     ...
+
+======================================================================
+  STEP 5b: Baseline Comparison
+======================================================================
+  Model                            Accuracy  Precision   Recall       F1
+  PPS Threshold (best)              0.XXXX     0.XXXX   0.XXXX   0.XXXX
+  Majority Class (always normal)    0.XXXX     0.XXXX   0.XXXX   0.XXXX
+  Logistic Regression               0.XXXX     0.XXXX   0.XXXX   0.XXXX
+  Random Forest (ours)              0.XXXX     0.XXXX   0.XXXX   0.XXXX
 ```
 
-Results vary based on dataset size and random seed. Larger datasets (100K+ flows) generally yield better separation between normal and attack classes.
+The training script also runs **5-fold cross-validation**, **baseline comparison** (majority class, logistic regression, PPS threshold), and **adversarial robustness testing** at multiple noise levels.
 
 ### Live Detection
 
-When an attack is detected, the controller prints:
+When an attack is detected, the controller logs:
 
 ```
-DDoS ATTACK DETECTED on switch dpid=X: src=10.0.0.Y dst=10.0.0.Z type=ICMP Flood pps=XXXX.X
-ATTACK BLOCKED: DROP rule installed for src=10.0.0.Y on switch dpid=X (expires in 300s)
+DDoS ATTACK DETECTED on switch dpid=5: src=10.0.0.3 dst=10.0.0.7 type=ICMP Flood pps=12847.3 confidence=0.983
+ATTACK BLOCKED: DROP rule installed for src=10.0.0.3 dst=10.0.0.7 proto=1 on switch dpid=5 (expires in 287s)
 ```
 
-| Detection Parameter    | Value                            |
-|------------------------|----------------------------------|
-| Flow polling interval  | 5 seconds                        |
-| Block rule priority    | 32768 (highest)                  |
-| Block rule duration    | 300 seconds (auto-expires)       |
-| Supported attack types | ICMP Flood, SYN Flood, UDP Flood |
+| Detection Parameter     | Value                                     |
+|-------------------------|--------------------------------------------|
+| Flow polling interval   | 5 seconds (configurable via `ryu.conf`)    |
+| Block rule priority     | 32768                                      |
+| Block rule duration     | ~300 seconds (randomized ±20%)             |
+| Confidence threshold    | 0.7 (configurable)                         |
+| Supported attack types  | ICMP Flood, SYN Flood, UDP Flood           |
 
 ---
 
 ## Tech Stack
 
-| Component               | Technology                                       |
-|-------------------------|--------------------------------------------------|
-| SDN Controller          | Ryu 4.34 (OpenFlow 1.3)                          |
-| Network Emulation       | Mininet 2.3+ with Open vSwitch                   |
-| ML Classifier           | scikit-learn Random Forest (100 trees, depth 20) |
-| Feature Scaling         | StandardScaler (fit on training data only)       |
-| Attack Simulation       | hping3 (ICMP, SYN, UDP floods)                   |
-| Traffic Generation      | iperf, wget, ping                                |
-| Performance Monitoring  | psutil                                           |
-| Language                | Python 3.8+ / Bash                               |
+| Component               | Technology                                                  |
+|-------------------------|-------------------------------------------------------------|
+| SDN Controller          | Ryu 4.34 (OpenFlow 1.3)                                    |
+| Network Emulation       | Mininet 2.3+ with Open vSwitch                             |
+| ML Classifier           | scikit-learn Random Forest (100 trees, depth 20, balanced)  |
+| Feature Scaling         | StandardScaler (fit on training data only)                  |
+| Model Integrity         | SHA-256 hash verification before loading                    |
+| Attack Simulation       | hping3 (ICMP, SYN, UDP floods)                             |
+| Traffic Generation      | iperf, wget, ping                                          |
+| Testing                 | pytest (34 tests)                                          |
+| Performance Monitoring  | psutil                                                     |
+| Language                | Python 3.8+ / Bash                                        |
 
 ---
 
@@ -160,14 +206,14 @@ ATTACK BLOCKED: DROP rule installed for src=10.0.0.Y on switch dpid=X (expires i
 ```
 ├── sdn_controller/
 │   ├── mitigation_module.py    # Ryu controller with ML-based DDoS detection
-│   └── ryu.conf                # Controller configuration
+│   └── ryu.conf                # Controller configuration (bindings, polling interval)
 │
 ├── network_topology/
-│   ├── topology.py             # Mininet spine-leaf topology (5 switches, 10 hosts)
-│   └── ovs_config.sh           # Open vSwitch configuration
+│   ├── topology.py             # Mininet spine-leaf topology (configurable size)
+│   └── ovs_config.sh           # Open vSwitch configuration (standalone fail-mode)
 │
 ├── ml_model/
-│   ├── train_model.py          # Random Forest training and evaluation
+│   ├── train_model.py          # RF training, cross-validation, baselines, adversarial tests
 │   └── create_roc.py           # ROC curve visualization
 │
 ├── traffic_generation/
@@ -175,18 +221,24 @@ ATTACK BLOCKED: DROP rule installed for src=10.0.0.Y on switch dpid=X (expires i
 │   └── attack_generator.sh     # DDoS attack simulator using hping3
 │
 ├── datasets/
-│   ├── generate_full_dataset.py  # Synthetic flow dataset generator
+│   ├── generate_full_dataset.py  # Synthetic 12-feature flow dataset generator
 │   └── dataset_info.txt          # Dataset specification
 │
 ├── utilities/
-│   ├── feature_extractor.py    # Standalone feature extraction module
-│   ├── dataset_collector.py    # CSV collection with file locking
+│   ├── feature_extractor.py    # Feature definitions — single source of truth (12 features)
+│   ├── dataset_collector.py    # Buffered CSV collection with file locking
 │   └── performance_monitor.py  # Controller CPU/memory/flow monitoring
 │
+├── tests/
+│   ├── test_feature_extractor.py  # 18 tests for feature extraction and validation
+│   └── test_dataset_collector.py  # 16 tests for dataset collection
+│
 ├── logs/
-│   ├── init_logs.sh            # Log file initialization
+│   ├── init_logs.sh            # Log file initialization (640 permissions)
 │   └── analyze_logs.py         # Post-run analysis and reporting
 │
+├── AUDIT_REPORT.md             # Security audit findings (56 items)
+├── CHANGELOG.md                # Version history
 └── requirements.txt            # Python dependencies
 ```
 
@@ -220,6 +272,8 @@ cd datasets && python3 generate_full_dataset.py --total 505433 && cd ..
 cd ml_model && python3 train_model.py && cd ..
 ```
 
+This generates `flow_model.pkl`, `scaler.pkl`, and `model_hashes.json` (integrity hashes).
+
 **2. Start the controller** (Terminal 1):
 
 ```bash
@@ -244,12 +298,7 @@ cd traffic_generation && sudo python3 generate_normal.py --duration 300
 cd traffic_generation && sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --duration 60
 ```
 
-**6. Watch the controller terminal for:**
-
-```
-DDoS ATTACK DETECTED on switch dpid=5: src=10.0.0.3 dst=10.0.0.7 type=ICMP Flood pps=12847.3
-ATTACK BLOCKED: DROP rule installed for src=10.0.0.3 on switch dpid=5 (expires in 300s)
-```
+**6. Watch the controller terminal** for detection and mitigation logs.
 
 ### Supported Attack Types
 
@@ -267,6 +316,12 @@ sudo bash attack_generator.sh --type udp --target 10.0.0.3 --duration 60
 sudo bash attack_generator.sh --type all --target 10.0.0.7 --duration 30
 ```
 
+### Run Tests
+
+```bash
+python3 -m pytest tests/ -v
+```
+
 ---
 
 ## Troubleshooting
@@ -275,12 +330,14 @@ sudo bash attack_generator.sh --type all --target 10.0.0.7 --duration 30
 |------------------------------------|--------------------------------------------------------|
 | `ryu-manager: command not found`   | `pip3 install ryu==4.34`                               |
 | `ML model files not found` warning | Run `cd ml_model && python3 train_model.py` first      |
+| Model integrity verification fails | Re-run `train_model.py` to regenerate model and hashes |
 | `This script must be run as root`  | Use `sudo` for topology.py and traffic scripts         |
 | Mininet cleanup errors             | Run `sudo mn -c` then restart topology                 |
-| `pingall` shows packet loss        | Wait a few seconds for MAC learning, retry             |
+| `pingall` shows packet loss        | Wait 15s for STP convergence, then retry               |
 | `hping3: command not found`        | `sudo apt-get install hping3`                          |
 | No switch connections              | Ensure controller is running *before* starting network |
 | Low model accuracy                 | Use larger dataset (50,000+ flows)                     |
+
 ---
 
 ## License

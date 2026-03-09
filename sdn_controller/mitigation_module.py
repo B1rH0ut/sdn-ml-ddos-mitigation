@@ -5,19 +5,19 @@ SDN Controller with ML-based DDoS Detection and Mitigation
 This Ryu application implements an OpenFlow 1.3 controller that:
 1. Manages MAC learning and packet forwarding across the network
 2. Collects flow statistics from all connected switches every 5 seconds
-3. Extracts 10 features from flow statistics for ML classification
+3. Extracts 12 features from flow statistics for ML classification
 4. Uses a trained Random Forest model to classify flows as normal or attack
 5. Installs DROP rules to block detected DDoS attack flows
+6. Implements loop prevention via per-switch flooding tracking
+7. Rate-limits PacketIn events to prevent controller DoS
+8. Verifies ML model integrity via SHA-256 before loading
+9. Provides graceful shutdown with signal handling
+10. Enforces MAC table aging and port security
+11. Uses confidence threshold for ML predictions
+12. Samples large flow tables for scalability
 
-The controller integrates with the ML model trained by ml_model/train_model.py
-and logs detected attacks to logs/attacks_log.csv.
-
-Features extracted (in order):
-    1. flow_duration_sec     6. packet_count_per_second
-    2. idle_timeout          7. byte_count_per_second
-    3. hard_timeout          8. ip_proto
-    4. packet_count          9. icmp_code
-    5. byte_count           10. icmp_type
+Features extracted (in order) — defined in utilities/feature_extractor.py:
+    See FEATURE_NAMES in utilities/feature_extractor.py
 
 Usage:
     ryu-manager mitigation_module.py
@@ -34,13 +34,241 @@ from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet
+from ryu.lib.packet import packet, ethernet, arp, ipv4 as ipv4_pkt
 from ryu.lib import hub
 import joblib
 import numpy as np
+import hashlib
+import json
 import time
 import csv
 import os
+import sys
+import signal
+import random
+import re
+import threading
+import logging
+import logging.handlers
+
+# Error handling conventions for this module:
+#   - Event handlers: catch specific exceptions, log, continue (never crash controller)
+#   - Background threads: broad catch at loop level, specific inside
+#   - File I/O: catch IOError specifically
+#   - ML inference: catch Exception (sklearn can raise various types), track failures
+#   - External commands: never called from controller (use subprocess in traffic scripts)
+
+# IPv4 validation pattern for log sanitization
+_IPV4_PATTERN = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+# Import feature definitions from the single source of truth
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from utilities.feature_extractor import FEATURE_NAMES, EXPECTED_FEATURE_COUNT
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Flow statistics polling interval in seconds (default; overridden by ryu.conf)
+STATS_POLL_INTERVAL = 5
+
+# Allow ryu.conf to override via CONF object
+from ryu import cfg as ryu_cfg
+ryu_cfg.CONF.register_opt(
+    ryu_cfg.IntOpt('stats_poll_interval', default=5,
+                   help='Flow stats polling interval in seconds')
+)
+
+# Block rule priority (highest to override normal forwarding)
+BLOCK_RULE_PRIORITY = 32768
+
+# Block rule hard timeout in seconds (auto-expires)
+BLOCK_RULE_TIMEOUT = 300
+
+# Normal forwarding flow timeouts
+# Increased from 10/30 to reduce PacketIn churn
+FORWARDING_IDLE_TIMEOUT = 30
+FORWARDING_HARD_TIMEOUT = 120
+
+# PacketIn rate limiting: max events per switch per second
+PACKET_IN_RATE_LIMIT = 100
+PACKET_IN_WINDOW_SEC = 1.0
+
+# LLDP ethertype (filtered from packet processing)
+LLDP_ETHERTYPE = 0x88cc
+
+# IPv4 ethertype
+IPV4_ETHERTYPE = 0x0800
+
+# IPv6 ethertype (detected but not yet classified)
+IPV6_ETHERTYPE = 0x86DD
+
+# Model integrity hash file name
+MODEL_HASH_FILE = 'model_hashes.json'
+
+# MAC table aging — entries older than this are evicted (seconds)
+MAC_AGE_TIMEOUT = 300
+
+# Port security — maximum MACs allowed per port per switch
+MAX_MACS_PER_PORT = 5
+
+# Confidence threshold — only block flows with attack probability
+# above this threshold. Reduces false positives.
+CONFIDENCE_THRESHOLD = 0.7
+
+# Flood rate limiting — max floods per switch per second
+FLOOD_RATE_LIMIT = 50
+FLOOD_RATE_WINDOW_SEC = 1.0
+
+# Flow sampling — when a stats reply exceeds this many flows,
+# sample this fraction for ML classification (1.0 = no sampling)
+FLOW_SAMPLE_THRESHOLD = 500
+FLOW_SAMPLE_RATIO = 0.3
+
+# Syslog integration for SIEM (set to None to disable)
+# On macOS: '/var/run/syslog', on Linux: '/dev/log' or ('siem-host', 514)
+SYSLOG_ADDRESS = '/dev/log'
+SYSLOG_FACILITY = logging.handlers.SysLogHandler.LOG_LOCAL0
+
+
+class PacketInRateLimiter:
+    """
+    Sliding-window rate limiter for PacketIn events per switch.
+
+    Prevents controller DoS by dropping excess PacketIn events when
+    a switch exceeds the configured rate limit.
+    """
+
+    def __init__(self, rate_limit=PACKET_IN_RATE_LIMIT,
+                 window_sec=PACKET_IN_WINDOW_SEC):
+        self.rate_limit = rate_limit
+        self.window_sec = window_sec
+        self._counters = {}
+        self._window_start = {}
+
+    def allow(self, dpid):
+        """Check if a PacketIn from the given switch should be processed."""
+        now = time.time()
+
+        if dpid not in self._window_start:
+            self._window_start[dpid] = now
+            self._counters[dpid] = 0
+
+        elapsed = now - self._window_start[dpid]
+        if elapsed >= self.window_sec:
+            self._window_start[dpid] = now
+            self._counters[dpid] = 0
+
+        if self._counters[dpid] >= self.rate_limit:
+            return False
+
+        self._counters[dpid] += 1
+        return True
+
+
+class FloodRateLimiter:
+    """
+    Rate limiter for flood (broadcast) packets per switch.
+
+    Prevents broadcast storms from overwhelming the network by limiting
+    how many OFPP_FLOOD actions are sent per switch per time window.
+    """
+
+    def __init__(self, rate_limit=FLOOD_RATE_LIMIT,
+                 window_sec=FLOOD_RATE_WINDOW_SEC):
+        self.rate_limit = rate_limit
+        self.window_sec = window_sec
+        self._counters = {}
+        self._window_start = {}
+
+    def allow(self, dpid):
+        """Check if a flood action on the given switch should be allowed."""
+        now = time.time()
+
+        if dpid not in self._window_start:
+            self._window_start[dpid] = now
+            self._counters[dpid] = 0
+
+        elapsed = now - self._window_start[dpid]
+        if elapsed >= self.window_sec:
+            self._window_start[dpid] = now
+            self._counters[dpid] = 0
+
+        if self._counters[dpid] >= self.rate_limit:
+            return False
+
+        self._counters[dpid] += 1
+        return True
+
+
+def _verify_model_integrity(model_path, scaler_path, hash_file_path, logger):
+    """
+    Verify SHA-256 integrity of model and scaler files before loading.
+
+    Prevents loading tampered model files containing malicious
+    pickle payloads.
+
+    Args:
+        model_path (str): Path to flow_model.pkl.
+        scaler_path (str): Path to scaler.pkl.
+        hash_file_path (str): Path to model_hashes.json.
+        logger: Ryu logger instance.
+
+    Returns:
+        bool: True if hashes match or hash file doesn't exist (first run).
+    """
+    if not os.path.isfile(hash_file_path):
+        logger.warning(
+            "Model hash file not found at %s. "
+            "Cannot verify model integrity. "
+            "Re-run train_model.py to generate hash file.",
+            hash_file_path
+        )
+        return True
+
+    try:
+        with open(hash_file_path, 'r') as f:
+            expected_hashes = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error("Failed to read model hash file %s: %s",
+                     hash_file_path, str(e))
+        return False
+
+    files_to_check = {
+        'flow_model.pkl': model_path,
+        'scaler.pkl': scaler_path,
+    }
+
+    for filename, filepath in files_to_check.items():
+        if filename not in expected_hashes:
+            logger.error("No expected hash for %s in hash file", filename)
+            return False
+
+        sha256 = hashlib.sha256()
+        try:
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(8192), b''):
+                    sha256.update(chunk)
+        except IOError as e:
+            logger.error("Failed to read %s for hashing: %s", filepath, str(e))
+            return False
+
+        actual_hash = sha256.hexdigest()
+        expected_hash = expected_hashes[filename]
+
+        if actual_hash != expected_hash:
+            logger.critical(
+                "MODEL INTEGRITY FAILURE: %s hash mismatch! "
+                "Expected: %s, Got: %s. "
+                "Model file may have been tampered with. "
+                "Re-run train_model.py to regenerate.",
+                filename, expected_hash, actual_hash
+            )
+            return False
+
+    logger.info("Model integrity verified (SHA-256 hashes match)")
+    return True
 
 
 class DDoSDetectionController(app_manager.RyuApp):
@@ -52,61 +280,104 @@ class DDoSDetectionController(app_manager.RyuApp):
     2. Periodic flow statistics collection from all connected switches
     3. ML-based DDoS detection with automatic flow blocking
 
-    Attributes:
-        mac_to_port (dict): MAC address to port mapping per datapath.
-            Structure: {datapath_id: {mac_address: port_number}}
-        datapaths (dict): Connected switch datapaths.
-            Structure: {datapath_id: datapath_object}
-        model: Trained Random Forest classifier loaded from flow_model.pkl,
-            or None if model file is not found.
-        scaler: StandardScaler loaded from scaler.pkl for feature normalization,
-            or None if scaler file is not found.
+    Security features:
+    - PacketIn rate limiting to prevent controller DoS
+    - SHA-256 model integrity verification before loading
+    - Specific flow-tuple DROP rules to prevent self-DoS
+    - Broadcast loop prevention via per-switch flood tracking
+    - MAC table aging with periodic eviction
+    - Port security: max MACs per port
+    - ML confidence threshold to reduce false positives
+    - Flood rate limiting per switch
+    - Flow sampling for large flow tables
+    - Graceful shutdown with signal handling
     """
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        """
-        Initialize the DDoS Detection Controller.
-
-        Sets up MAC learning table, datapath tracking, and attempts to load
-        the ML model and scaler from ../ml_model/. If model files are not
-        found, the controller continues operating as a basic L2 switch
-        without DDoS detection capability.
-        """
+        """Initialize the DDoS Detection Controller."""
         super(DDoSDetectionController, self).__init__(*args, **kwargs)
 
-        # MAC address to port mapping: {dpid: {mac: port}}
+        # Locks for shared state accessed by multiple green threads
+        self._mac_lock = threading.Lock()
+        self._blocked_lock = threading.Lock()
+        self._datapaths_lock = threading.Lock()
+        self._flood_lock = threading.Lock()
+
+        # MAC address to port mapping with timestamps for aging:
+        # {dpid: {mac: (port, timestamp)}}
         self.mac_to_port = {}
+
+        # Port security — track MACs per port
+        # {dpid: {port: set(mac_addresses)}}
+        self._port_macs = {}
 
         # Connected switch datapaths: {dpid: datapath}
         self.datapaths = {}
 
-        # Track IPs that already have active block rules to avoid duplicates
-        # Entries are removed after the block timeout (300s) expires
-        self.blocked_ips = {}  # {(dpid, src_ip): expiry_timestamp}
+        # Track IPs that already have active block rules
+        # {(dpid, src_ip, dst_ip, ip_proto): expiry_timestamp}
+        self.blocked_ips = {}
 
-        # ML model and scaler initialization
+        # PacketIn rate limiter
+        self._packet_in_limiter = PacketInRateLimiter()
+
+        # Flood rate limiter per switch
+        self._flood_limiter = FloodRateLimiter()
+
+        # Broadcast loop prevention
+        self._flood_history = {}
+        self._flood_suppress_window = 1.0
+
+        # Graceful shutdown flag
+        self._shutting_down = False
+
+        # Track consecutive ML prediction failures
+        self._consecutive_ml_failures = 0
+
+        # Concept drift detection — track prediction distributions
+        self._prediction_history = []  # List of (timestamp, mean_attack_prob)
+        self._drift_window = 60  # seconds to accumulate before checking
+        self._drift_baseline_mean = None  # Set after first window
+        self._drift_threshold = 0.15  # Alert if mean shifts by more than this
+
+        # ML model and scaler
         self.model = None
         self.scaler = None
 
-        # Resolve model file paths relative to this script's directory
+        # Load ML model with integrity verification
         script_dir = os.path.dirname(os.path.abspath(__file__))
         model_path = os.path.join(script_dir, '..', 'ml_model', 'flow_model.pkl')
         scaler_path = os.path.join(script_dir, '..', 'ml_model', 'scaler.pkl')
+        hash_file_path = os.path.join(script_dir, '..', 'ml_model', MODEL_HASH_FILE)
 
-        # Attempt to load the trained ML model and feature scaler
         try:
+            if not _verify_model_integrity(
+                model_path, scaler_path, hash_file_path, self.logger
+            ):
+                raise ValueError(
+                    "Model integrity verification failed. "
+                    "Refusing to load potentially tampered model files."
+                )
+
             self.model = joblib.load(model_path)
             self.scaler = joblib.load(scaler_path)
             self.logger.info("ML model loaded successfully from %s", model_path)
-            self.logger.info("Feature scaler loaded successfully from %s", scaler_path)
+            self.logger.info("Feature scaler loaded successfully from %s",
+                             scaler_path)
         except FileNotFoundError:
             self.logger.warning(
                 "ML model files not found at %s. "
                 "Controller will operate without DDoS detection. "
                 "Train the model first: cd ml_model && python3 train_model.py",
                 model_path
+            )
+        except ValueError as e:
+            self.logger.critical(
+                "SECURITY: %s. "
+                "Controller will operate without DDoS detection.",
+                str(e)
             )
         except Exception as e:
             self.logger.error(
@@ -115,15 +386,230 @@ class DDoSDetectionController(app_manager.RyuApp):
                 str(e)
             )
 
-        # Ensure logs directory exists for attack logging
+        # Ensure logs directory exists
         self.log_dir = os.path.join(script_dir, '..', 'logs')
         os.makedirs(self.log_dir, exist_ok=True)
 
-        # Start periodic flow statistics collection thread
-        # This thread requests stats from all switches every 5 seconds
-        self.stats_thread = hub.spawn(self._request_stats)
+        # Initialize attack log header once
+        self._init_attack_log()
 
+        # Restore persisted state from previous run
+        self._restore_state()
+
+        # Health check counter — logs periodic status
+        self._stats_cycle_count = 0
+
+        # Start background threads
+        self.stats_thread = hub.spawn(self._request_stats)
+        self._cleanup_thread = hub.spawn(self._periodic_cleanup)
+
+        # Attach syslog handler for SIEM integration
+        self._setup_syslog()
+
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+        # VLAN awareness not implemented — flat L2 domain assumed
+        # Future: add VLAN-aware MAC learning and per-VLAN detection policies
+
+        # System validated in Mininet only — hardware switches may
+        # have different flow table limits, timing, and OpenFlow behavior
         self.logger.info("DDoS Detection Controller initialized")
+        self.logger.info(
+            "Validated in Mininet environment only. "
+            "Hardware switch behavior may differ."
+        )
+        self.logger.info(
+            "Encrypted (TLS/HTTPS) traffic is classified by flow-level "
+            "features only. Application-layer attacks may evade detection."
+        )
+        self.logger.info(
+            "Config: stats_poll=%ds, confidence_threshold=%.2f, mac_age=%ds, "
+            "max_macs_per_port=%d, flow_sample_threshold=%d",
+            ryu_cfg.CONF.stats_poll_interval, CONFIDENCE_THRESHOLD,
+            MAC_AGE_TIMEOUT, MAX_MACS_PER_PORT, FLOW_SAMPLE_THRESHOLD
+        )
+
+    # =========================================================================
+    # Graceful shutdown
+    # =========================================================================
+
+    def _signal_handler(self, signum, frame):
+        """
+        Handle SIGTERM/SIGINT for graceful shutdown.
+
+        Sets the shutdown flag and logs the event. Background threads
+        check this flag and exit their loops cleanly.
+
+        Args:
+            signum: Signal number received.
+            frame: Current stack frame (unused).
+        """
+        sig_name = signal.Signals(signum).name
+        self.logger.info(
+            "Received %s — initiating graceful shutdown...", sig_name
+        )
+        self._shutting_down = True
+
+        # Persist state before shutdown
+        self._save_state()
+
+        # Log final statistics
+        self.logger.info(
+            "Shutdown stats: %d switches connected, %d active block rules",
+            len(self.datapaths), len(self.blocked_ips)
+        )
+
+    def close(self):
+        """
+        Clean up resources on application shutdown.
+
+        Called by Ryu framework during app teardown.
+        Persists state before exit.
+        """
+        self._shutting_down = True
+        self._save_state()
+        self.logger.info("Controller shutting down, cleaning up resources")
+        super(DDoSDetectionController, self).close()
+
+    # =========================================================================
+    # State persistence (save/restore across restarts)
+    # =========================================================================
+
+    def _get_state_path(self):
+        """Return path to the controller state file."""
+        return os.path.join(self.log_dir, 'controller_state.json')
+
+    def _save_state(self):
+        """
+        Persist blocked_ips to disk for recovery after restart.
+
+        Saves active block entries so they can be restored.
+        """
+        state_path = self._get_state_path()
+        try:
+            with self._blocked_lock:
+                now = time.time()
+                # Only save entries that haven't expired
+                active_blocks = {
+                    # Convert tuple key to string for JSON
+                    f"{dpid}|{src}|{dst}|{proto}": expiry
+                    for (dpid, src, dst, proto), expiry
+                    in self.blocked_ips.items()
+                    if expiry > now
+                }
+
+            state = {
+                'version': 1,
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'blocked_ips': active_blocks,
+            }
+
+            with open(state_path, 'w') as f:
+                json.dump(state, f, indent=2)
+
+            self.logger.info(
+                "Saved state (%d active blocks) to %s",
+                len(active_blocks), state_path
+            )
+        except (IOError, TypeError) as e:
+            self.logger.error("Failed to save state: %s", str(e))
+
+    def _restore_state(self):
+        """
+        Restore blocked_ips from disk after restart.
+
+        Re-populates in-memory state from last save.
+        """
+        state_path = self._get_state_path()
+        if not os.path.isfile(state_path):
+            return
+
+        try:
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+
+            if state.get('version') != 1:
+                self.logger.warning("Unknown state version, skipping restore")
+                return
+
+            now = time.time()
+            restored = 0
+            for key_str, expiry in state.get('blocked_ips', {}).items():
+                if expiry <= now:
+                    continue  # Already expired
+                parts = key_str.split('|')
+                if len(parts) != 4:
+                    continue
+                dpid, src, dst, proto = int(parts[0]), parts[1], parts[2], int(parts[3])
+                self.blocked_ips[(dpid, src, dst, proto)] = expiry
+                restored += 1
+
+            if restored:
+                self.logger.info(
+                    "Restored %d active block entries from %s",
+                    restored, state_path
+                )
+
+            # Clean up state file after successful restore
+            os.remove(state_path)
+
+        except (IOError, json.JSONDecodeError, ValueError) as e:
+            self.logger.error("Failed to restore state: %s", str(e))
+
+    # =========================================================================
+    # INIT HELPER: Set up attack log file with headers
+    # =========================================================================
+
+    def _init_attack_log(self):
+        """
+        Initialize the attacks_log.csv file with headers if it doesn't exist.
+
+        Called once during __init__.
+        """
+        log_file = os.path.join(self.log_dir, 'attacks_log.csv')
+        if not os.path.isfile(log_file):
+            try:
+                with open(log_file, 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow([
+                        'timestamp', 'src_ip', 'dst_ip',
+                        'attack_type', 'packet_rate', 'confidence',
+                        'action', 'switch'
+                    ])
+            except IOError as e:
+                self.logger.error("Failed to initialize attack log: %s",
+                                  str(e))
+
+    # =========================================================================
+    # Syslog handler for SIEM integration
+    # =========================================================================
+
+    def _setup_syslog(self):
+        """
+        Attach a syslog handler to the controller logger for SIEM integration.
+
+        Sends WARNING+ log messages to syslog/SIEM.
+        Fails gracefully if syslog is unavailable.
+        """
+        try:
+            syslog_handler = logging.handlers.SysLogHandler(
+                address=SYSLOG_ADDRESS,
+                facility=SYSLOG_FACILITY
+            )
+            syslog_handler.setLevel(logging.WARNING)
+            syslog_fmt = logging.Formatter(
+                'SDN-DDoS[%(process)d]: %(levelname)s %(message)s'
+            )
+            syslog_handler.setFormatter(syslog_fmt)
+            self.logger.addHandler(syslog_handler)
+            self.logger.info("Syslog handler attached (WARNING+)")
+        except (OSError, ConnectionError):
+            self.logger.info(
+                "Syslog not available at %s — SIEM logging disabled",
+                SYSLOG_ADDRESS
+            )
 
     # =========================================================================
     # HELPER: Add flow entry to a switch
@@ -131,29 +617,14 @@ class DDoSDetectionController(app_manager.RyuApp):
 
     def _add_flow(self, datapath, priority, match, actions,
                   idle_timeout=0, hard_timeout=0):
-        """
-        Install a flow entry on a switch.
-
-        Constructs and sends an OFPFlowMod message to install a forwarding
-        rule on the specified switch.
-
-        Args:
-            datapath: Switch datapath object to install the flow on.
-            priority (int): Flow entry priority (higher = matched first).
-            match: OFPMatch object specifying which packets to match.
-            actions (list): List of OFPAction objects to apply to matched packets.
-            idle_timeout (int): Seconds of inactivity before flow expires (0=never).
-            hard_timeout (int): Seconds before flow expires regardless (0=never).
-        """
+        """Install a flow entry on a switch."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Wrap actions in an Apply-Actions instruction
         instructions = [
             parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
         ]
 
-        # Build and send the FlowMod message
         flow_mod = parser.OFPFlowMod(
             datapath=datapath,
             priority=priority,
@@ -165,31 +636,151 @@ class DDoSDetectionController(app_manager.RyuApp):
         datapath.send_msg(flow_mod)
 
     # =========================================================================
+    # MAC table aging
+    # =========================================================================
+
+    def _learn_mac(self, dpid, mac, port):
+        """
+        Learn a MAC address with timestamp for aging.
+
+        Also enforces port security: if a port already has
+        MAX_MACS_PER_PORT different MACs, the new MAC is rejected.
+
+        Protected by _mac_lock.
+
+        Args:
+            dpid: Switch datapath ID.
+            mac (str): MAC address to learn.
+            port (int): Port number where the MAC was seen.
+
+        Returns:
+            bool: True if the MAC was learned, False if rejected by
+                  port security.
+        """
+        with self._mac_lock:
+            self.mac_to_port.setdefault(dpid, {})
+            self._port_macs.setdefault(dpid, {})
+            self._port_macs[dpid].setdefault(port, set())
+
+            # Check port security limit
+            port_mac_set = self._port_macs[dpid][port]
+            if mac not in port_mac_set:
+                if len(port_mac_set) >= MAX_MACS_PER_PORT:
+                    self.logger.warning(
+                        "Port security violation on dpid=%s port=%s. "
+                        "Rejecting MAC %s (limit=%d reached: %s)",
+                        dpid, port, mac, MAX_MACS_PER_PORT, port_mac_set
+                    )
+                    return False
+                port_mac_set.add(mac)
+
+            # Store MAC with timestamp for aging
+            self.mac_to_port[dpid][mac] = (port, time.time())
+            return True
+
+    def _lookup_mac(self, dpid, mac):
+        """
+        Look up a MAC address, returning the port if the entry is not aged out.
+
+        Protected by _mac_lock.
+
+        Args:
+            dpid: Switch datapath ID.
+            mac (str): MAC address to look up.
+
+        Returns:
+            int or None: Port number if found and not expired, else None.
+        """
+        with self._mac_lock:
+            if dpid not in self.mac_to_port:
+                return None
+            entry = self.mac_to_port[dpid].get(mac)
+            if entry is None:
+                return None
+
+            port, timestamp = entry
+            if time.time() - timestamp > MAC_AGE_TIMEOUT:
+                # Entry aged out — remove it
+                del self.mac_to_port[dpid][mac]
+                # Also remove from port security tracking
+                if dpid in self._port_macs and port in self._port_macs[dpid]:
+                    self._port_macs[dpid][port].discard(mac)
+                return None
+
+            return port
+
+    def _age_mac_table(self):
+        """
+        Evict expired MAC entries from all switches.
+
+        Called by the periodic cleanup thread. Protected by _mac_lock.
+        """
+        now = time.time()
+        total_evicted = 0
+
+        with self._mac_lock:
+            for dpid in list(self.mac_to_port.keys()):
+                expired_macs = [
+                    mac for mac, (port, ts) in self.mac_to_port[dpid].items()
+                    if now - ts > MAC_AGE_TIMEOUT
+                ]
+                for mac in expired_macs:
+                    port, _ = self.mac_to_port[dpid][mac]
+                    del self.mac_to_port[dpid][mac]
+                    # Clean port security tracking
+                    if dpid in self._port_macs and port in self._port_macs[dpid]:
+                        self._port_macs[dpid][port].discard(mac)
+                    total_evicted += 1
+
+        if total_evicted:
+            self.logger.info("Aged out %d MAC entries", total_evicted)
+
+    # =========================================================================
+    # HELPER: Randomized block timeout
+    # =========================================================================
+
+    def _random_block_timeout(self):
+        """
+        Return a randomized block timeout to prevent predictable attack windows.
+
+        Instead of a fixed 300s, randomize within +/- 20%.
+        """
+        return random.randint(
+            int(BLOCK_RULE_TIMEOUT * 0.8),
+            int(BLOCK_RULE_TIMEOUT * 1.2)
+        )
+
+    # =========================================================================
+    # HELPER: Sanitize IP for logging
+    # =========================================================================
+
+    @staticmethod
+    def _sanitize_ip(ip_str):
+        """
+        Validate and sanitize an IP address string for safe CSV logging.
+
+        Prevents CSV injection via malformed IP strings.
+        """
+        if isinstance(ip_str, str) and _IPV4_PATTERN.match(ip_str):
+            return ip_str
+        return 'INVALID'
+
+    # =========================================================================
     # EVENT HANDLER: Switch connection (CONFIG_DISPATCHER)
     # =========================================================================
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """
-        Handle new switch connections.
-
-        Called when a switch completes the OpenFlow handshake. Installs a
-        table-miss flow entry that sends unmatched packets to the controller,
-        enabling reactive forwarding via packet_in_handler.
-
-        Args:
-            ev: EventOFPSwitchFeatures event containing the switch datapath.
-        """
+        """Handle new switch connections."""
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         dpid = datapath.id
 
-        # Register this datapath for periodic stats collection
-        self.datapaths[dpid] = datapath
+        with self._datapaths_lock:
+            self.datapaths[dpid] = datapath
 
         # Install table-miss flow entry (priority 0, match all)
-        # Unmatched packets are sent to the controller for MAC learning
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(
             ofproto.OFPP_CONTROLLER,
@@ -200,6 +791,37 @@ class DDoSDetectionController(app_manager.RyuApp):
         self.logger.info("Switch connected: dpid=%s", dpid)
 
     # =========================================================================
+    # LOOP PREVENTION: Check if flood should be suppressed
+    # =========================================================================
+
+    def _should_suppress_flood(self, dpid, src_mac, dst_mac, ethertype):
+        """
+        Check if a broadcast/flood packet should be suppressed.
+
+        Protected by _flood_lock.
+
+        Args:
+            dpid: Switch datapath ID.
+            src_mac (str): Source MAC address.
+            dst_mac (str): Destination MAC address.
+            ethertype (int): Ethernet frame type.
+
+        Returns:
+            bool: True if this flood should be suppressed (duplicate).
+        """
+        flood_key = (dpid, src_mac, dst_mac, ethertype)
+        now = time.time()
+
+        with self._flood_lock:
+            if flood_key in self._flood_history:
+                last_flood = self._flood_history[flood_key]
+                if now - last_flood < self._flood_suppress_window:
+                    return True
+
+            self._flood_history[flood_key] = now
+            return False
+
+    # =========================================================================
     # EVENT HANDLER: Packet-In (MAIN_DISPATCHER)
     # =========================================================================
 
@@ -208,17 +830,12 @@ class DDoSDetectionController(app_manager.RyuApp):
         """
         Handle packets sent to the controller.
 
-        Implements L2 MAC learning and forwarding:
-        1. Learns the source MAC address and its ingress port
-        2. Looks up the destination MAC address in the learned table
-        3. If destination is known, installs a flow entry and forwards
-        4. If destination is unknown, floods the packet to all ports
-
-        Flow entries are installed with idle_timeout=10 and hard_timeout=30
-        to allow periodic re-evaluation by the ML detection system.
-
-        Args:
-            ev: EventOFPPacketIn event containing the received packet.
+        Implements L2 MAC learning and forwarding with:
+        - Rate limiting to prevent controller DoS
+        - MAC table aging
+        - Port security
+        - Flood suppression to prevent broadcast loops
+        - Flood rate limiting
         """
         msg = ev.msg
         datapath = msg.datapath
@@ -227,35 +844,51 @@ class DDoSDetectionController(app_manager.RyuApp):
         dpid = datapath.id
         in_port = msg.match['in_port']
 
-        # Parse the incoming packet to extract Ethernet header
+        # Rate limit PacketIn events per switch
+        if not self._packet_in_limiter.allow(dpid):
+            return
+
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # Ignore LLDP packets (used for topology discovery, not data)
-        if eth.ethertype == 0x88cc:
+        if eth.ethertype == LLDP_ETHERTYPE:
             return
+
+        # Log IPv6 traffic (not yet supported for DDoS classification)
+        if eth.ethertype == IPV6_ETHERTYPE:
+            self.logger.debug(
+                "IPv6 packet on dpid=%s port=%s — "
+                "not classified (IPv6 DDoS detection not implemented)",
+                dpid, in_port
+            )
 
         src_mac = eth.src
         dst_mac = eth.dst
 
-        # Initialize MAC table for this switch if not present
-        self.mac_to_port.setdefault(dpid, {})
+        # Learn MAC with aging and port security
+        if not self._learn_mac(dpid, src_mac, in_port):
+            # Port security violation — drop the packet
+            return
 
-        # Learn source MAC address: map it to the ingress port
-        self.mac_to_port[dpid][src_mac] = in_port
+        # Look up destination MAC with aging check
+        out_port_lookup = self._lookup_mac(dpid, dst_mac)
 
-        # Determine output port based on destination MAC lookup
-        if dst_mac in self.mac_to_port[dpid]:
-            # Destination MAC is known - forward to the learned port
-            out_port = self.mac_to_port[dpid][dst_mac]
+        if out_port_lookup is not None:
+            out_port = out_port_lookup
         else:
-            # Destination MAC unknown - flood to all ports
+            # Suppress duplicate floods
+            if self._should_suppress_flood(dpid, src_mac, dst_mac,
+                                           eth.ethertype):
+                return
+
+            # Rate limit floods per switch
+            if not self._flood_limiter.allow(dpid):
+                return
+
             out_port = ofproto.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # If destination is known, install a flow entry to avoid future
-        # packet-in events for this MAC pair
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(
                 in_port=in_port,
@@ -267,11 +900,10 @@ class DDoSDetectionController(app_manager.RyuApp):
                 priority=1,
                 match=match,
                 actions=actions,
-                idle_timeout=10,
-                hard_timeout=30
+                idle_timeout=FORWARDING_IDLE_TIMEOUT,
+                hard_timeout=FORWARDING_HARD_TIMEOUT
             )
 
-        # Send the buffered packet out
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
@@ -289,31 +921,44 @@ class DDoSDetectionController(app_manager.RyuApp):
         """
         Periodically request flow statistics from all connected switches.
 
-        Runs as a background thread (spawned in __init__ via hub.spawn).
-        Every 5 seconds, sends an OFPFlowStatsRequest to each registered
-        datapath. The replies are handled by flow_stats_reply_handler().
-
-        This continuous polling enables near-real-time DDoS detection by
-        ensuring the ML model receives fresh flow data for classification.
+        Checks the shutdown flag each iteration.
+        Logs health status every 12 cycles (~60s at default 5s interval).
         """
-        while True:
-            # Snapshot the datapaths to avoid RuntimeError if a switch
-            # connects or disconnects during iteration
-            for dpid, datapath in list(self.datapaths.items()):
+        while not self._shutting_down:
+            self._stats_cycle_count += 1
+
+            # Periodic health status log
+            if self._stats_cycle_count % 12 == 0:
+                ml_status = "ACTIVE" if self.model is not None else "DISABLED"
+                with self._datapaths_lock:
+                    n_switches = len(self.datapaths)
+                with self._blocked_lock:
+                    n_blocked = len(self.blocked_ips)
+                self.logger.info(
+                    "HEALTH: cycle=%d, switches=%d, blocked=%d, "
+                    "ml=%s, ml_failures=%d",
+                    self._stats_cycle_count, n_switches,
+                    n_blocked, ml_status,
+                    self._consecutive_ml_failures
+                )
+
+            with self._datapaths_lock:
+                dp_snapshot = list(self.datapaths.items())
+
+            for dpid, datapath in dp_snapshot:
                 try:
                     ofproto = datapath.ofproto
                     parser = datapath.ofproto_parser
 
-                    # Request all flow statistics (match-all, table 0)
                     request = parser.OFPFlowStatsRequest(
                         datapath,
-                        0,                          # flags
-                        ofproto.OFPTT_ALL,          # table_id: all tables
-                        ofproto.OFPP_ANY,           # out_port: any
-                        ofproto.OFPG_ANY,           # out_group: any
-                        0,                          # cookie
-                        0,                          # cookie_mask
-                        parser.OFPMatch()           # match: all flows
+                        0,
+                        ofproto.OFPTT_ALL,
+                        ofproto.OFPP_ANY,
+                        ofproto.OFPG_ANY,
+                        0,
+                        0,
+                        parser.OFPMatch()
                     )
                     datapath.send_msg(request)
                 except Exception as e:
@@ -322,8 +967,52 @@ class DDoSDetectionController(app_manager.RyuApp):
                         dpid, str(e)
                     )
 
-            # Wait 5 seconds before next collection cycle
-            hub.sleep(5)
+            hub.sleep(ryu_cfg.CONF.stats_poll_interval)
+
+        self.logger.info("Stats polling thread exiting (shutdown)")
+
+    # =========================================================================
+    # PERIODIC CLEANUP
+    # =========================================================================
+
+    def _periodic_cleanup(self):
+        """
+        Periodically clean up expired entries to prevent memory leaks.
+
+        Handles: blocked_ips, flood_history, MAC table aging.
+        Checks shutdown flag each iteration.
+        """
+        while not self._shutting_down:
+            hub.sleep(60)
+
+            now = time.time()
+
+            # Clean expired blocked_ips entries (protected by lock)
+            with self._blocked_lock:
+                expired_keys = [
+                    key for key, expiry in list(self.blocked_ips.items())
+                    if now >= expiry
+                ]
+                for key in expired_keys:
+                    self.blocked_ips.pop(key, None)
+            if expired_keys:
+                self.logger.info(
+                    "Cleaned %d expired block entries", len(expired_keys)
+                )
+
+            # Clean old flood history entries (protected by lock)
+            with self._flood_lock:
+                old_flood_keys = [
+                    key for key, ts in list(self._flood_history.items())
+                    if now - ts > self._flood_suppress_window * 10
+                ]
+                for key in old_flood_keys:
+                    self._flood_history.pop(key, None)
+
+            # Age out MAC table entries
+            self._age_mac_table()
+
+        self.logger.info("Cleanup thread exiting (shutdown)")
 
     # =========================================================================
     # EVENT HANDLER: Flow Statistics Reply (MAIN_DISPATCHER)
@@ -334,174 +1023,292 @@ class DDoSDetectionController(app_manager.RyuApp):
         """
         Handle flow statistics replies from switches.
 
-        Processes each flow entry returned by the switch:
-        1. Extracts 10 features from the flow statistics
-        2. Normalizes features using the trained scaler
-        3. Classifies the flow using the Random Forest model
-        4. If classified as attack (label=1), blocks the source IP
+        Spawns processing in a green thread to avoid blocking
+        the Ryu event loop while processing other switches' replies.
+        """
+        # Process stats in a separate green thread
+        hub.spawn(self._process_flow_stats, ev)
 
-        Feature extraction order must match the training dataset columns:
-            flow_duration_sec, idle_timeout, hard_timeout, packet_count,
-            byte_count, packet_count_per_second, byte_count_per_second,
-            ip_proto, icmp_code, icmp_type
+    def _process_flow_stats(self, ev):
+        """
+        Process flow statistics from a single switch.
 
-        Args:
-            ev: EventOFPFlowStatsReply event containing flow statistics.
+        Two-pass approach for aggregate features:
+          Pass 1: Parse all flows, build per-destination aggregates
+          Pass 2: Extract 12 features per flow (including aggregates),
+                  batch predict with confidence threshold, and mitigate
+
+        Samples flows when table exceeds FLOW_SAMPLE_THRESHOLD.
+        Uses batched ML inference for performance.
         """
         datapath = ev.msg.datapath
         dpid = datapath.id
         body = ev.msg.body
 
+        if self.model is None or self.scaler is None:
+            return
+
+        # =====================================================================
+        # Filter non-classifiable flows
+        # =====================================================================
+        classifiable = []
+        skipped_non_ipv4 = 0
         for stat in body:
-            # =================================================================
-            # FEATURE EXTRACTION: Extract 10 features from flow statistics
-            # =================================================================
+            if stat.priority == 0:
+                continue
+            # Count flows without IPv4 match fields
+            if stat.match.get('ipv4_src', 'unknown') == 'unknown' and \
+               stat.match.get('ipv4_dst', 'unknown') == 'unknown':
+                skipped_non_ipv4 += 1
+                continue
+            classifiable.append(stat)
 
-            # Feature 1: Flow duration in seconds
+        if skipped_non_ipv4 > 0:
+            self.logger.debug(
+                "Skipped %d non-IPv4 flows on dpid=%s "
+                "(ARP, MAC-only, or non-IP traffic)",
+                skipped_non_ipv4, dpid
+            )
+
+        if not classifiable:
+            return
+
+        # =====================================================================
+        # Sample flows if table is very large
+        # =====================================================================
+        if len(classifiable) > FLOW_SAMPLE_THRESHOLD:
+            sample_size = max(
+                int(len(classifiable) * FLOW_SAMPLE_RATIO),
+                FLOW_SAMPLE_THRESHOLD  # always classify at least threshold
+            )
+            sampled = random.sample(classifiable, sample_size)
+            self.logger.debug(
+                "Sampled %d/%d flows on dpid=%s",
+                sample_size, len(classifiable), dpid
+            )
+        else:
+            sampled = classifiable
+
+        # =====================================================================
+        # PASS 1: Parse flows and build per-destination aggregates
+        # =====================================================================
+        parsed_flows = []
+        dst_flow_counts = {}
+        dst_source_sets = {}
+        dst_earliest_time = {}
+
+        for stat in sampled:
             flow_duration_sec = stat.duration_sec
-
-            # Feature 2: Idle timeout configured for this flow
-            idle_timeout = stat.idle_timeout
-
-            # Feature 3: Hard timeout configured for this flow
-            hard_timeout = stat.hard_timeout
-
-            # Feature 4: Total packet count for this flow
             packet_count = stat.packet_count
-
-            # Feature 5: Total byte count for this flow
             byte_count = stat.byte_count
-
-            # Feature 6: Packets per second (handle division by zero)
-            # When duration is 0 (flow just installed), use packet_count as-is
-            if flow_duration_sec > 0:
-                packet_count_per_second = packet_count / flow_duration_sec
-            else:
-                packet_count_per_second = packet_count
-
-            # Feature 7: Bytes per second (handle division by zero)
-            if flow_duration_sec > 0:
-                byte_count_per_second = byte_count / flow_duration_sec
-            else:
-                byte_count_per_second = byte_count
-
-            # Features 8-10: Protocol fields from flow match
-            # These may not be present in all flow entries (e.g., table-miss)
-            # OFPMatch.get() returns the default when the field is absent
             ip_proto = stat.match.get('ip_proto', 0)
             icmp_code = stat.match.get('icmp_code', 0)
             icmp_type = stat.match.get('icmp_type', 0)
+            src_ip = stat.match.get('ipv4_src', 'unknown')
+            dst_ip = stat.match.get('ipv4_dst', 'unknown')
 
-            # =================================================================
-            # ML CLASSIFICATION: Predict if flow is normal or attack
-            # =================================================================
+            if flow_duration_sec > 0:
+                pps = packet_count / flow_duration_sec
+                bps = byte_count / flow_duration_sec
+            else:
+                pps = packet_count
+                bps = byte_count
 
-            # Skip classification if ML model is not loaded
-            if self.model is None or self.scaler is None:
-                continue
+            if packet_count > 0:
+                avg_pkt_size = byte_count / packet_count
+            else:
+                avg_pkt_size = 0
 
-            # Skip table-miss flow entry (priority 0, no useful features)
-            if stat.priority == 0:
-                continue
+            parsed_flows.append({
+                'duration': flow_duration_sec,
+                'packet_count': packet_count,
+                'byte_count': byte_count,
+                'pps': pps,
+                'bps': bps,
+                'avg_pkt_size': avg_pkt_size,
+                'ip_proto': ip_proto,
+                'icmp_code': icmp_code,
+                'icmp_type': icmp_type,
+                'src_ip': src_ip,
+                'dst_ip': dst_ip,
+            })
 
-            # Assemble features in the exact order used during training
+            if dst_ip != 'unknown':
+                dst_flow_counts[dst_ip] = dst_flow_counts.get(dst_ip, 0) + 1
+                if dst_ip not in dst_source_sets:
+                    dst_source_sets[dst_ip] = set()
+                if src_ip != 'unknown':
+                    dst_source_sets[dst_ip].add(src_ip)
+                if dst_ip not in dst_earliest_time:
+                    dst_earliest_time[dst_ip] = flow_duration_sec
+                else:
+                    dst_earliest_time[dst_ip] = max(
+                        dst_earliest_time[dst_ip], flow_duration_sec
+                    )
+
+        if not parsed_flows:
+            return
+
+        # =====================================================================
+        # PASS 2: Build 12-feature vectors with aggregates, batch classify
+        # =====================================================================
+        batch_features = []
+        batch_metadata = []
+
+        for flow in parsed_flows:
+            dst_ip = flow['dst_ip']
+
+            flows_to_dst = dst_flow_counts.get(dst_ip, 0)
+            unique_sources = len(dst_source_sets.get(dst_ip, set()))
+            time_window = dst_earliest_time.get(dst_ip, 0)
+            if time_window > 0:
+                flow_creation_rate = flows_to_dst / time_window
+            else:
+                flow_creation_rate = flows_to_dst
+
             features = [
-                flow_duration_sec,          # 1. flow_duration_sec
-                idle_timeout,               # 2. idle_timeout
-                hard_timeout,               # 3. hard_timeout
-                packet_count,               # 4. packet_count
-                byte_count,                 # 5. byte_count
-                packet_count_per_second,    # 6. packet_count_per_second
-                byte_count_per_second,      # 7. byte_count_per_second
-                ip_proto,                   # 8. ip_proto
-                icmp_code,                  # 9. icmp_code
-                icmp_type,                  # 10. icmp_type
+                flow['duration'],
+                flow['packet_count'],
+                flow['byte_count'],
+                flow['pps'],
+                flow['bps'],
+                flow['avg_pkt_size'],
+                flow['ip_proto'],
+                flow['icmp_code'],
+                flow['icmp_type'],
+                flows_to_dst,
+                unique_sources,
+                flow_creation_rate,
             ]
 
-            try:
-                # Reshape to 2D array as expected by scaler and model
-                features_array = np.array(features).reshape(1, -1)
+            batch_features.append(features)
+            batch_metadata.append({
+                'src_ip': flow['src_ip'],
+                'dst_ip': flow['dst_ip'],
+                'ip_proto': flow['ip_proto'],
+                'icmp_type': flow['icmp_type'],
+                'pps': flow['pps'],
+            })
 
-                # Normalize features using the same scaler used during training
-                # (loaded from ../ml_model/scaler.pkl)
-                normalized = self.scaler.transform(features_array)
-
-                # Classify: 0 = normal traffic, 1 = DDoS attack
-                prediction = self.model.predict(normalized)
-
-                if prediction[0] == 1:
-                    # Attack detected - extract source IP for blocking
-                    src_ip = stat.match.get('ipv4_src', 'unknown')
-                    dst_ip = stat.match.get('ipv4_dst', 'unknown')
-
-                    # Skip mitigation if source IP is unavailable
-                    # (flows installed by MAC learning lack IPv4 match fields)
-                    if src_ip == 'unknown':
-                        continue
-
-                    # Determine attack type based on protocol number
-                    attack_type = self._get_attack_type(ip_proto, icmp_type)
-
-                    self.logger.warning(
-                        "DDoS ATTACK DETECTED on switch dpid=%s: "
-                        "src=%s dst=%s type=%s pps=%.1f",
-                        dpid, src_ip, dst_ip, attack_type,
-                        packet_count_per_second
-                    )
-
-                    # Install DROP rule only if not already blocked
-                    # Prevents flooding the switch with duplicate FlowMod messages
-                    block_key = (dpid, src_ip)
-                    now = time.time()
-
-                    # Clean expired entries and check if already blocked
-                    if block_key in self.blocked_ips:
-                        if now < self.blocked_ips[block_key]:
-                            # Block rule still active, skip reinstall
-                            pass
-                        else:
-                            # Previous block expired, reinstall
-                            del self.blocked_ips[block_key]
-
-                    if block_key not in self.blocked_ips:
-                        self._install_block_rule(datapath, src_ip)
-                        # Track with 300s expiry matching the hard_timeout
-                        self.blocked_ips[block_key] = now + 300
-
-                    # Log the attack to CSV file
-                    self._log_attack(
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        attack_type=attack_type,
-                        packet_rate=packet_count_per_second,
-                        switch=dpid
-                    )
-
-            except Exception as e:
-                self.logger.error(
-                    "ML prediction error on switch dpid=%s: %s",
-                    dpid, str(e)
+        # =====================================================================
+        # BATCH ML CLASSIFICATION with confidence threshold
+        # =====================================================================
+        try:
+            features_array = np.array(batch_features)
+            normalized = self.scaler.transform(features_array)
+            # Use predict_proba instead of predict for confidence
+            probabilities = self.model.predict_proba(normalized)
+        except Exception as e:
+            # Track consecutive failures and alert if systematic
+            self._consecutive_ml_failures += 1
+            self.logger.error(
+                "ML batch prediction error on switch dpid=%s: %s "
+                "(consecutive failures: %d)",
+                dpid, str(e), self._consecutive_ml_failures
+            )
+            if self._consecutive_ml_failures >= 5:
+                self.logger.critical(
+                    "ML prediction has failed %d consecutive times. "
+                    "Detection may be systematically broken. "
+                    "Check model/scaler compatibility with current feature set.",
+                    self._consecutive_ml_failures
                 )
+            return
+
+        # Reset failure counter on success
+        self._consecutive_ml_failures = 0
+
+        # Track prediction distribution for concept drift detection
+        attack_probs = probabilities[:, 1]
+        mean_prob = float(attack_probs.mean())
+        now_ts = time.time()
+        self._prediction_history.append((now_ts, mean_prob))
+
+        # Trim history older than 2 * drift_window
+        cutoff = now_ts - self._drift_window * 2
+        self._prediction_history = [
+            (ts, mp) for ts, mp in self._prediction_history if ts > cutoff
+        ]
+
+        # Check for drift after accumulating enough data
+        recent = [mp for ts, mp in self._prediction_history
+                  if ts > now_ts - self._drift_window]
+        if len(recent) >= 5:
+            current_mean = sum(recent) / len(recent)
+            if self._drift_baseline_mean is None:
+                self._drift_baseline_mean = current_mean
+            else:
+                drift = abs(current_mean - self._drift_baseline_mean)
+                if drift > self._drift_threshold:
+                    self.logger.warning(
+                        "CONCEPT DRIFT: mean attack probability shifted "
+                        "from %.3f to %.3f (delta=%.3f, threshold=%.3f). "
+                        "Model may need retraining.",
+                        self._drift_baseline_mean, current_mean,
+                        drift, self._drift_threshold
+                    )
+                # Slowly adapt baseline (exponential moving average)
+                self._drift_baseline_mean = (
+                    0.95 * self._drift_baseline_mean + 0.05 * current_mean
+                )
+
+        # =====================================================================
+        # PROCESS PREDICTIONS with confidence threshold
+        # =====================================================================
+        for i in range(len(probabilities)):
+            attack_prob = probabilities[i][1]  # P(attack)
+
+            # Only act if confidence exceeds threshold
+            if attack_prob < CONFIDENCE_THRESHOLD:
+                continue
+
+            meta = batch_metadata[i]
+            src_ip = meta['src_ip']
+            dst_ip = meta['dst_ip']
+            ip_proto = meta['ip_proto']
+
+            if src_ip == 'unknown':
+                continue
+
+            attack_type = self._get_attack_type(ip_proto, meta['icmp_type'])
+
+            self.logger.warning(
+                "DDoS ATTACK DETECTED on switch dpid=%s: "
+                "src=%s dst=%s type=%s pps=%.1f confidence=%.3f",
+                dpid, src_ip, dst_ip, attack_type, meta['pps'], attack_prob
+            )
+
+            # Atomic check-and-set on blocked_ips with lock
+            block_key = (dpid, src_ip, dst_ip, ip_proto)
+            now = time.time()
+
+            with self._blocked_lock:
+                existing_expiry = self.blocked_ips.get(block_key)
+                if existing_expiry is not None and now < existing_expiry:
+                    continue  # Still active
+
+                # Randomized timeout to prevent predictable attack windows
+                timeout = self._random_block_timeout()
+                self.blocked_ips[block_key] = now + timeout
+
+            self._install_block_rule(datapath, src_ip, dst_ip, ip_proto,
+                                     timeout=timeout)
+
+            self._log_attack(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                attack_type=attack_type,
+                packet_rate=meta['pps'],
+                confidence=attack_prob,
+                switch=dpid
+            )
 
     # =========================================================================
     # HELPER: Determine attack type from protocol fields
     # =========================================================================
 
     def _get_attack_type(self, ip_proto, icmp_type):
-        """
-        Determine the DDoS attack type based on protocol fields.
-
-        Maps IP protocol numbers and ICMP types to human-readable
-        attack type labels.
-
-        Args:
-            ip_proto (int): IP protocol number (1=ICMP, 6=TCP, 17=UDP).
-            icmp_type (int): ICMP type value (8=echo request).
-
-        Returns:
-            str: Attack type label (e.g., 'ICMP Flood', 'SYN Flood',
-                 'UDP Flood', or 'Unknown').
-        """
+        """Determine the DDoS attack type based on protocol fields."""
         if ip_proto == 1:
             return 'ICMP Flood'
         elif ip_proto == 6:
@@ -512,112 +1319,96 @@ class DDoSDetectionController(app_manager.RyuApp):
             return 'Unknown (proto={})'.format(ip_proto)
 
     # =========================================================================
-    # MITIGATION: Install DROP rule to block attacking source IP
+    # MITIGATION: Install DROP rule for specific attack flow
     # =========================================================================
 
-    def _install_block_rule(self, datapath, src_ip):
+    def _install_block_rule(self, datapath, src_ip, dst_ip, ip_proto,
+                            timeout=None):
         """
-        Install a high-priority DROP rule to block traffic from an attacking IP.
+        Install a high-priority DROP rule to block a specific attack flow.
 
-        Creates an OpenFlow flow entry that matches all IPv4 packets from the
-        specified source IP and drops them (empty action list). The rule is
-        installed with a hard timeout of 300 seconds (5 minutes), after which
-        the switch automatically removes it, allowing traffic to resume if the
-        attack has stopped.
-
-        Args:
-            datapath: Switch datapath object where the block rule is installed.
-            src_ip (str): IPv4 address of the attacking host (e.g., '10.0.0.5').
+        Matches on (src_ip, dst_ip, ip_proto) tuple.
+        Uses randomized timeout if not specified.
         """
+        if timeout is None:
+            timeout = self._random_block_timeout()
+
         parser = datapath.ofproto_parser
         dpid = datapath.id
 
         try:
-            # Match all IPv4 packets from the attacking source IP
-            # eth_type=0x0800 is required to enable IPv4 match fields
-            match = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=src_ip
-            )
+            match_fields = {
+                'eth_type': IPV4_ETHERTYPE,
+                'ipv4_src': src_ip,
+                'ipv4_dst': dst_ip,
+            }
+            if ip_proto > 0:
+                match_fields['ip_proto'] = ip_proto
 
-            # Empty action list = DROP (packets are discarded)
-            actions = []
+            match = parser.OFPMatch(**match_fields)
+            actions = []  # Empty = DROP
 
-            # Install with high priority (32768) to override normal forwarding
-            # hard_timeout=300s: rule auto-expires after 5 minutes
             self._add_flow(
                 datapath,
-                priority=32768,
+                priority=BLOCK_RULE_PRIORITY,
                 match=match,
                 actions=actions,
-                hard_timeout=300
+                hard_timeout=timeout
             )
 
             self.logger.info(
-                "ATTACK BLOCKED: DROP rule installed for src=%s "
-                "on switch dpid=%s (expires in 300s)",
-                src_ip, dpid
+                "ATTACK BLOCKED: DROP rule installed for "
+                "src=%s dst=%s proto=%s on switch dpid=%s (expires in %ds)",
+                src_ip, dst_ip, ip_proto, dpid, timeout
             )
 
         except Exception as e:
             self.logger.error(
-                "Failed to install block rule for %s on switch dpid=%s: %s",
-                src_ip, dpid, str(e)
+                "Failed to install block rule for %s->%s on switch dpid=%s: %s",
+                src_ip, dst_ip, dpid, str(e)
             )
 
     # =========================================================================
     # LOGGING: Record detected attacks to CSV file
     # =========================================================================
 
-    def _log_attack(self, src_ip, dst_ip, attack_type, packet_rate, switch):
+    def _log_attack(self, src_ip, dst_ip, attack_type, packet_rate,
+                    confidence, switch):
         """
         Log a detected DDoS attack to the attacks_log.csv file.
-
-        Appends a row to ../logs/attacks_log.csv with attack details. If the
-        file does not exist, creates it with appropriate CSV headers first.
-
-        CSV columns:
-            timestamp, src_ip, dst_ip, attack_type, packet_rate, action, switch
 
         Args:
             src_ip (str): Source IP address of the attacker.
             dst_ip (str): Destination IP address of the target.
-            attack_type (str): Type of attack ('ICMP Flood', 'SYN Flood',
-                'UDP Flood', or 'Unknown').
-            packet_rate (float): Packets per second observed in the flow.
-            switch: Datapath ID of the switch that reported the flow.
+            attack_type (str): Type of attack.
+            packet_rate (float): Packets per second observed.
+            confidence (float): ML model confidence.
+            switch: Datapath ID of the reporting switch.
         """
         log_file = os.path.join(self.log_dir, 'attacks_log.csv')
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
 
-        try:
-            # Check if file exists to determine whether to write headers
-            file_exists = os.path.isfile(log_file)
+        # Sanitize IPs to prevent CSV injection
+        safe_src = self._sanitize_ip(src_ip)
+        safe_dst = self._sanitize_ip(dst_ip)
 
+        try:
             with open(log_file, 'a', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-
-                # Write header row if this is a new file
-                if not file_exists:
-                    writer.writerow([
-                        'timestamp', 'src_ip', 'dst_ip',
-                        'attack_type', 'packet_rate', 'action', 'switch'
-                    ])
-
-                # Write the attack record
                 writer.writerow([
                     timestamp,
-                    src_ip,
-                    dst_ip,
+                    safe_src,
+                    safe_dst,
                     attack_type,
                     f'{packet_rate:.2f}',
+                    f'{confidence:.3f}',
                     'BLOCKED',
                     switch
                 ])
 
             self.logger.info(
-                "Attack logged: %s -> %s (%s) on switch %s",
-                src_ip, dst_ip, attack_type, switch
+                "Attack logged: %s -> %s (%s, conf=%.3f) on switch %s",
+                src_ip, dst_ip, attack_type, confidence, switch
             )
 
         except IOError as e:

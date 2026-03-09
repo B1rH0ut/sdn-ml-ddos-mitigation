@@ -34,22 +34,12 @@ import argparse
 import os
 import sys
 
-
-# Feature columns in exact order (must match train_model.py)
-FEATURE_COLUMNS = [
-    'flow_duration_sec',
-    'idle_timeout',
-    'hard_timeout',
-    'packet_count',
-    'byte_count',
-    'packet_count_per_second',
-    'byte_count_per_second',
-    'ip_proto',
-    'icmp_code',
-    'icmp_type'
-]
-
-LABEL_COLUMN = 'label'
+# Import feature definitions from the single source of truth
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from utilities.feature_extractor import (
+    FEATURE_NAMES as FEATURE_COLUMNS,
+    LABEL_COLUMN,
+)
 
 
 def load_artifacts(script_dir):

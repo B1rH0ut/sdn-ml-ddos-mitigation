@@ -8,10 +8,8 @@ feature scaler are saved as .pkl files for use by the Ryu SDN controller
 (sdn_controller/mitigation_module.py).
 
 Dataset Requirements:
-    - CSV file with 11 columns (10 features + 1 label)
-    - Features: flow_duration_sec, idle_timeout, hard_timeout, packet_count,
-      byte_count, packet_count_per_second, byte_count_per_second, ip_proto,
-      icmp_code, icmp_type
+    - CSV file with 13 columns (12 features + 1 label)
+    - Features defined in utilities/feature_extractor.py
     - Label: 0 = normal traffic, 1 = DDoS attack
     - No NaN or Inf values (rows with NaN are dropped automatically)
 
@@ -30,9 +28,12 @@ Usage:
 
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.dummy import DummyClassifier
+from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -43,37 +44,29 @@ from sklearn.metrics import (
     roc_auc_score
 )
 import joblib
+import hashlib
+import json
 import argparse
 import os
 import sys
 
-
-# Expected feature columns in exact order (must match controller extraction)
-FEATURE_COLUMNS = [
-    'flow_duration_sec',
-    'idle_timeout',
-    'hard_timeout',
-    'packet_count',
-    'byte_count',
-    'packet_count_per_second',
-    'byte_count_per_second',
-    'ip_proto',
-    'icmp_code',
-    'icmp_type'
-]
-
-LABEL_COLUMN = 'label'
-
-# Total expected columns: 10 features + 1 label
-EXPECTED_COLUMNS = FEATURE_COLUMNS + [LABEL_COLUMN]
+# Import feature definitions from the single source of truth
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from utilities.feature_extractor import (
+    FEATURE_NAMES as FEATURE_COLUMNS,
+    EXPECTED_FEATURE_COUNT,
+    CSV_HEADERS as EXPECTED_COLUMNS,
+    LABEL_COLUMN,
+)
 
 
 def load_dataset(filepath):
     """
     Load and validate the flow dataset from a CSV file.
 
-    Reads the CSV, verifies it contains the expected 11 columns (10 features
-    + label), and drops any rows with missing values.
+    Reads the CSV, verifies it contains the expected columns (features
+    + label as defined in feature_extractor), and drops any rows with
+    missing values.
 
     Args:
         filepath (str): Path to the CSV dataset file.
@@ -104,9 +97,11 @@ def load_dataset(filepath):
     print(f"  Loaded {len(df)} rows, {len(df.columns)} columns")
 
     # Validate column count
-    if len(df.columns) != 11:
+    expected_col_count = EXPECTED_FEATURE_COUNT + 1  # features + label
+    if len(df.columns) != expected_col_count:
         raise ValueError(
-            f"Expected 11 columns (10 features + 1 label), "
+            f"Expected {expected_col_count} columns "
+            f"({EXPECTED_FEATURE_COUNT} features + 1 label), "
             f"got {len(df.columns)}.\n"
             f"Expected columns: {EXPECTED_COLUMNS}\n"
             f"Got columns: {list(df.columns)}"
@@ -148,25 +143,26 @@ def load_dataset(filepath):
     print(f"    Total flows:   {len(df)}")
     print(f"    Normal (0):    {(y == 0).sum()} ({(y == 0).mean() * 100:.1f}%)")
     print(f"    Attack (1):    {(y == 1).sum()} ({(y == 1).mean() * 100:.1f}%)")
-    print(f"    Features:      {len(FEATURE_COLUMNS)}")
+    print(f"    Features:      {EXPECTED_FEATURE_COUNT}")
 
     return X, y
 
 
-def train_and_evaluate(X, y):
+def train_and_evaluate(X, y, temporal_split=False):
     """
     Split data, normalize, train Random Forest, and evaluate performance.
 
     Performs the following steps:
-    1. Splits data 75/25 with stratification to maintain class balance
+    1. Splits data 75/25 with stratification (or temporal order if --temporal-split)
     2. Fits StandardScaler on training data only (prevents data leakage)
     3. Transforms both train and test data
     4. Trains RandomForestClassifier with 100 trees, max depth 20
     5. Evaluates on test set with multiple metrics
 
     Args:
-        X (DataFrame): Feature matrix with 10 columns.
+        X (DataFrame): Feature matrix.
         y (Series): Label vector (0=normal, 1=attack).
+        temporal_split (bool): If True, use time-based split.
 
     Returns:
         tuple: (model, scaler, metrics_dict) containing the trained model,
@@ -179,12 +175,21 @@ def train_and_evaluate(X, y):
     print("  STEP 2: Splitting Dataset")
     print("=" * 70)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=0.25,
-        random_state=42,
-        stratify=y  # Maintain class balance in both sets
-    )
+    if temporal_split:
+        # Time-based split — first 75% for training, last 25% for testing
+        # This simulates real deployment where model trains on past data
+        split_idx = int(len(X) * 0.75)
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        print("  Split method:  TEMPORAL (first 75% train, last 25% test)")
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=0.25,
+            random_state=42,
+            stratify=y  # Maintain class balance in both sets
+        )
+        print("  Split method:  Stratified random (75/25, random_state=42)")
 
     print(f"  Training set:  {len(X_train)} flows "
           f"({(y_train == 0).sum()} normal, {(y_train == 1).sum()} attack)")
@@ -215,9 +220,10 @@ def train_and_evaluate(X, y):
     print("=" * 70)
 
     model = RandomForestClassifier(
-        n_estimators=100,   # 100 decision trees in the forest
-        max_depth=20,       # Maximum depth of each tree
-        random_state=42     # Reproducible results
+        n_estimators=100,       # 100 decision trees in the forest
+        max_depth=20,           # Maximum depth of each tree
+        class_weight='balanced',  # Adjust weights inversely proportional to class frequency
+        random_state=42         # Reproducible results
     )
 
     print("  Parameters:")
@@ -231,10 +237,42 @@ def train_and_evaluate(X, y):
     print("  Training complete!")
 
     # =========================================================================
-    # STEP 5: Model Evaluation
+    # STEP 4b: 5-Fold Stratified Cross-Validation
     # =========================================================================
     print("\n" + "=" * 70)
-    print("  STEP 5: Evaluating Model Performance")
+    print("  STEP 4b: 5-Fold Stratified Cross-Validation")
+    print("=" * 70)
+
+    # Build a pipeline so each fold fits its own scaler (no data leakage)
+    cv_pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', RandomForestClassifier(
+            n_estimators=100, max_depth=20,
+            class_weight='balanced', random_state=42
+        ))
+    ])
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scoring = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
+
+    print("  Running 5-fold cross-validation on training set...")
+    cv_results = cross_validate(
+        cv_pipeline, X_train, y_train,
+        cv=cv, scoring=cv_scoring, return_train_score=False
+    )
+
+    print("\n  Cross-Validation Results (mean +/- std):")
+    for metric in cv_scoring:
+        key = f'test_{metric}'
+        scores = cv_results[key]
+        print(f"    {metric:<12s}  {scores.mean():.4f} +/- {scores.std():.4f}"
+              f"  (folds: {', '.join(f'{s:.4f}' for s in scores)})")
+
+    # =========================================================================
+    # STEP 5: Model Evaluation (holdout test set)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("  STEP 5: Evaluating Model Performance (holdout test set)")
     print("=" * 70)
 
     # Generate predictions on test set
@@ -303,6 +341,120 @@ def train_and_evaluate(X, y):
         bar = '#' * int(importance * 50)
         print(f"    {feature:<30} {importance:.4f} {bar}")
 
+    # =========================================================================
+    # STEP 5b: Baseline Comparison
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("  STEP 5b: Baseline Comparison")
+    print("=" * 70)
+    print("  Comparing Random Forest against simpler baselines to demonstrate")
+    print("  that the model adds value beyond trivial classifiers.\n")
+
+    baselines = [
+        ("Majority Class (always normal)", DummyClassifier(strategy='most_frequent')),
+        ("Stratified Random", DummyClassifier(strategy='stratified', random_state=42)),
+        ("Logistic Regression", LogisticRegression(
+            class_weight='balanced', max_iter=1000, random_state=42
+        )),
+    ]
+
+    # Also add a simple PPS threshold baseline
+    # Find the best threshold on pps (packet_count_per_second)
+    pps_col_idx = FEATURE_COLUMNS.index('packet_count_per_second')
+    pps_test = X_test_scaled[:, pps_col_idx]
+
+    best_pps_f1 = 0
+    best_pps_thresh = 0
+    for percentile in range(5, 100, 5):
+        thresh = np.percentile(pps_test, percentile)
+        pps_pred = (pps_test > thresh).astype(int)
+        pf1 = f1_score(y_test, pps_pred, zero_division=0)
+        if pf1 > best_pps_f1:
+            best_pps_f1 = pf1
+            best_pps_thresh = thresh
+
+    pps_pred_best = (pps_test > best_pps_thresh).astype(int)
+    pps_acc = accuracy_score(y_test, pps_pred_best)
+    pps_prec = precision_score(y_test, pps_pred_best, zero_division=0)
+    pps_rec = recall_score(y_test, pps_pred_best, zero_division=0)
+    pps_f1_final = f1_score(y_test, pps_pred_best, zero_division=0)
+
+    print(f"  {'Model':<32} {'Accuracy':>9} {'Precision':>10} "
+          f"{'Recall':>8} {'F1':>8}")
+    print(f"  {'-'*32} {'-'*9} {'-'*10} {'-'*8} {'-'*8}")
+
+    print(f"  {'PPS Threshold (best)':<32} {pps_acc:>9.4f} {pps_prec:>10.4f} "
+          f"{pps_rec:>8.4f} {pps_f1_final:>8.4f}")
+
+    for name, clf in baselines:
+        clf.fit(X_train_scaled, y_train)
+        bp = clf.predict(X_test_scaled)
+        b_acc = accuracy_score(y_test, bp)
+        b_prec = precision_score(y_test, bp, zero_division=0)
+        b_rec = recall_score(y_test, bp, zero_division=0)
+        b_f1 = f1_score(y_test, bp, zero_division=0)
+        print(f"  {name:<32} {b_acc:>9.4f} {b_prec:>10.4f} "
+              f"{b_rec:>8.4f} {b_f1:>8.4f}")
+
+    # Print RF results in the same table for comparison
+    print(f"  {'Random Forest (ours)':<32} {accuracy:>9.4f} {precision:>10.4f} "
+          f"{recall:>8.4f} {f1:>8.4f}")
+
+    rf_lift = f1 - best_pps_f1
+    print(f"\n  RF F1 lift over best PPS threshold: {rf_lift:+.4f}")
+    if rf_lift > 0.01:
+        print("  Random Forest provides meaningful improvement over simple threshold.")
+    else:
+        print("  WARNING: RF does not significantly outperform a simple threshold.")
+        print("  Consider improving the feature set or using real-world data.")
+
+    # =========================================================================
+    # STEP 5c: Adversarial Robustness Test
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("  STEP 5c: Adversarial Robustness Test")
+    print("=" * 70)
+    print("  Testing model accuracy under feature perturbation.\n")
+
+    # Perturb attack samples to make them look more like normal traffic
+    attack_mask = (y_test == 1).values
+    noise_levels = [0.05, 0.10, 0.20, 0.50]
+
+    print(f"  {'Noise Level':<15} {'Accuracy':>9} {'Recall':>8} {'F1':>8} {'Evaded':>8}")
+    print(f"  {'-'*15} {'-'*9} {'-'*8} {'-'*8} {'-'*8}")
+
+    for noise in noise_levels:
+        X_adv = X_test_scaled.copy()
+        # Add Gaussian noise to attack samples only
+        rng = np.random.RandomState(42)
+        perturbation = rng.normal(0, noise, X_adv[attack_mask].shape)
+        X_adv[attack_mask] += perturbation
+
+        y_adv = model.predict(X_adv)
+        adv_acc = accuracy_score(y_test, y_adv)
+        adv_rec = recall_score(y_test, y_adv, zero_division=0)
+        adv_f1 = f1_score(y_test, y_adv, zero_division=0)
+        # Count attacks that evaded detection
+        evaded = int((y_adv[attack_mask] == 0).sum())
+        total_attacks = int(attack_mask.sum())
+
+        print(f"  {noise:<15.2f} {adv_acc:>9.4f} {adv_rec:>8.4f} "
+              f"{adv_f1:>8.4f} {evaded:>5}/{total_attacks}")
+
+    # Summary assessment
+    # Test at 10% noise
+    X_adv_10 = X_test_scaled.copy()
+    rng = np.random.RandomState(42)
+    X_adv_10[attack_mask] += rng.normal(0, 0.10, X_adv_10[attack_mask].shape)
+    adv_f1_10 = f1_score(y_test, model.predict(X_adv_10), zero_division=0)
+    f1_drop = f1 - adv_f1_10
+
+    if f1_drop < 0.05:
+        print(f"\n  Model is reasonably robust (F1 drop at 10% noise: {f1_drop:.4f})")
+    else:
+        print(f"\n  WARNING: Model is fragile (F1 drop at 10% noise: {f1_drop:.4f})")
+        print("  Consider adversarial training or more robust features.")
+
     return model, scaler, metrics
 
 
@@ -350,10 +502,30 @@ def save_artifacts(model, scaler):
     except Exception as e:
         print(f"  WARNING: Verification failed: {e}")
 
+    # Generate SHA-256 hashes for model integrity verification.
+    # The controller checks these hashes before loading .pkl files to
+    # prevent loading tampered models (pickle deserialization RCE).
+    print("\n  Generating integrity hashes (SHA-256)...")
+    hashes = {}
+    for filename, filepath in [('flow_model.pkl', model_path),
+                               ('scaler.pkl', scaler_path)]:
+        sha256 = hashlib.sha256()
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha256.update(chunk)
+        hashes[filename] = sha256.hexdigest()
+        print(f"    {filename}: {hashes[filename]}")
+
+    hash_file_path = os.path.join(script_dir, 'model_hashes.json')
+    with open(hash_file_path, 'w') as f:
+        json.dump(hashes, f, indent=2)
+    print(f"  Hash file saved: {hash_file_path}")
+
     print(f"\n  These files will be loaded by the SDN controller:")
     print(f"    sdn_controller/mitigation_module.py")
     print(f"    Path used: ../ml_model/flow_model.pkl")
     print(f"    Path used: ../ml_model/scaler.pkl")
+    print(f"    Path used: ../ml_model/model_hashes.json (integrity check)")
 
 
 def main():
@@ -372,6 +544,12 @@ def main():
         type=str,
         default=None,
         help='Path to CSV dataset (default: ../datasets/flow_dataset.csv)'
+    )
+    parser.add_argument(
+        '--temporal-split',
+        action='store_true',
+        help='Use time-based train/test split (first 75%% train, last 25%% test) '
+             'instead of random stratified split'
     )
     args = parser.parse_args()
 
@@ -394,7 +572,9 @@ def main():
         X, y = load_dataset(dataset_path)
 
         # Steps 2-5: Train and evaluate model
-        model, scaler, metrics = train_and_evaluate(X, y)
+        model, scaler, metrics = train_and_evaluate(
+            X, y, temporal_split=args.temporal_split
+        )
 
         # Step 6: Save model and scaler
         save_artifacts(model, scaler)
