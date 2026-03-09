@@ -10,14 +10,15 @@ Feature definitions are imported from utilities/feature_extractor.py
 (the single source of truth).
 
 Normal Traffic (65%):
-    - ICMP (ping):  Low packet rates, small payloads
-    - TCP (data):   Medium-high duration, moderate rates
-    - HTTP (web):   Short bursts, small-medium payloads
+    - ICMP (ping):  Low-moderate packet rates, small payloads
+    - TCP (data):   Medium-high duration, up to 10K packets
+    - HTTP (web):   Short bursts, up to 2K packets
 
 Attack Traffic (35%):
-    - ICMP Flood:   Extremely high ICMP packet rates
-    - SYN Flood:    High TCP SYN rates (tiny packets)
-    - UDP Flood:    High UDP packet rates
+    - ICMP Flood:   800-8000 pps, high aggregate behavior
+    - SYN Flood:    500-6000 pps, tiny packets (~60 bytes)
+    - UDP Flood:    600-7000 pps, high aggregate behavior
+    - Borderline:   200-1500 pps, ambiguous flows near decision boundary
 
 Output CSV columns (13 total = 12 features + 1 label):
     flow_duration_sec, packet_count, byte_count,
@@ -65,9 +66,10 @@ NORMAL_SUBTYPES = {
 }
 
 ATTACK_SUBTYPES = {
-    'icmp_flood': 1 / 3,
-    'syn_flood':  1 / 3,
-    'udp_flood':  1 / 3,
+    'icmp_flood': 0.30,
+    'syn_flood':  0.30,
+    'udp_flood':  0.30,
+    'borderline': 0.10,
 }
 
 
@@ -133,14 +135,14 @@ def _build_flow(duration, packet_count, byte_count, ip_proto, icmp_code,
 
 def generate_icmp_ping():
     """Generate a single normal ICMP ping flow (12 features)."""
-    duration = random.uniform(0.5, 10.0)
-    packet_count = random.randint(5, 50)
-    byte_count = random.randint(500, 5000)
+    duration = random.uniform(0.5, 30.0)
+    packet_count = random.randint(5, 500)
+    byte_count = random.randint(500, 50000)
 
     # Normal aggregate behavior: few flows, few sources
-    flows_to_dst = random.randint(1, 8)
-    unique_sources = random.randint(1, 4)
-    flow_rate = random.uniform(0.1, 1.0)
+    flows_to_dst = random.randint(1, 15)
+    unique_sources = random.randint(1, 6)
+    flow_rate = random.uniform(0.1, 2.0)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -154,12 +156,12 @@ def generate_icmp_ping():
 def generate_tcp_data():
     """Generate a single normal TCP data transfer flow (12 features)."""
     duration = random.uniform(1.0, 300.0)
-    packet_count = random.randint(50, 5000)
-    byte_count = random.randint(5000, 500000)
+    packet_count = random.randint(50, 10000)
+    byte_count = random.randint(5000, 1000000)
 
-    flows_to_dst = random.randint(1, 15)
-    unique_sources = random.randint(1, 8)
-    flow_rate = random.uniform(0.1, 2.0)
+    flows_to_dst = random.randint(1, 25)
+    unique_sources = random.randint(1, 12)
+    flow_rate = random.uniform(0.1, 4.0)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -172,13 +174,13 @@ def generate_tcp_data():
 
 def generate_http_web():
     """Generate a single normal HTTP web browsing flow (12 features)."""
-    duration = random.uniform(0.1, 5.0)
-    packet_count = random.randint(10, 200)
-    byte_count = random.randint(1000, 100000)
+    duration = random.uniform(0.1, 10.0)
+    packet_count = random.randint(10, 2000)
+    byte_count = random.randint(1000, 200000)
 
-    flows_to_dst = random.randint(1, 20)
-    unique_sources = random.randint(1, 10)
-    flow_rate = random.uniform(0.2, 3.0)
+    flows_to_dst = random.randint(1, 30)
+    unique_sources = random.randint(1, 15)
+    flow_rate = random.uniform(0.2, 5.0)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -195,14 +197,16 @@ def generate_http_web():
 
 def generate_icmp_flood():
     """Generate a single ICMP Flood attack flow (12 features)."""
-    duration = random.uniform(0.1, 5.0)
-    packet_count = random.randint(10000, 100000)
-    byte_count = random.randint(500000, 5000000)
+    duration = random.uniform(0.5, 10.0)
+    # Floor ~800 pps: packet_count = pps * duration
+    pps = random.uniform(800, 8000)
+    packet_count = int(pps * duration)
+    byte_count = random.randint(packet_count * 60, packet_count * 120)
 
     # Attack aggregate behavior: many flows, many sources targeting same dst
-    flows_to_dst = random.randint(50, 500)
-    unique_sources = random.randint(20, 200)
-    flow_rate = random.uniform(10.0, 100.0)
+    flows_to_dst = random.randint(20, 300)
+    unique_sources = random.randint(10, 150)
+    flow_rate = random.uniform(5.0, 60.0)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -215,14 +219,16 @@ def generate_icmp_flood():
 
 def generate_syn_flood():
     """Generate a single SYN Flood attack flow (12 features)."""
-    duration = random.uniform(0.1, 10.0)
-    packet_count = random.randint(5000, 80000)
+    duration = random.uniform(0.5, 15.0)
+    # Floor ~500 pps
+    pps = random.uniform(500, 6000)
+    packet_count = int(pps * duration)
     # SYN floods have tiny packets (~60 bytes each)
     byte_count = random.randint(packet_count * 40, packet_count * 80)
 
-    flows_to_dst = random.randint(80, 600)
-    unique_sources = random.randint(30, 300)
-    flow_rate = random.uniform(15.0, 120.0)
+    flows_to_dst = random.randint(30, 400)
+    unique_sources = random.randint(15, 200)
+    flow_rate = random.uniform(8.0, 80.0)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -235,17 +241,52 @@ def generate_syn_flood():
 
 def generate_udp_flood():
     """Generate a single UDP Flood attack flow (12 features)."""
-    duration = random.uniform(0.1, 8.0)
-    packet_count = random.randint(8000, 90000)
-    byte_count = random.randint(400000, 4500000)
+    duration = random.uniform(0.5, 12.0)
+    # Floor ~600 pps
+    pps = random.uniform(600, 7000)
+    packet_count = int(pps * duration)
+    byte_count = random.randint(packet_count * 50, packet_count * 150)
 
-    flows_to_dst = random.randint(60, 450)
-    unique_sources = random.randint(25, 250)
-    flow_rate = random.uniform(12.0, 90.0)
+    flows_to_dst = random.randint(25, 350)
+    unique_sources = random.randint(12, 180)
+    flow_rate = random.uniform(6.0, 70.0)
 
     return _build_flow(
         duration, packet_count, byte_count,
         ip_proto=17, icmp_code=0, icmp_type=0,
+        flows_to_dst=flows_to_dst,
+        unique_sources_to_dst=unique_sources,
+        flow_creation_rate=flow_rate,
+    )
+
+
+def generate_borderline():
+    """
+    Generate a borderline/ambiguous flow near the decision boundary.
+
+    These flows have characteristics between normal and attack traffic,
+    forcing the classifier to learn subtle distinctions rather than
+    relying on trivially separable ranges.
+    """
+    duration = random.uniform(1.0, 20.0)
+    # 200-1500 pps: overlaps upper normal and lower attack
+    pps = random.uniform(200, 1500)
+    packet_count = int(pps * duration)
+    byte_count = random.randint(packet_count * 50, packet_count * 200)
+
+    # Moderate aggregate behavior: between normal and attack
+    flows_to_dst = random.randint(10, 80)
+    unique_sources = random.randint(5, 40)
+    flow_rate = random.uniform(2.0, 20.0)
+
+    # Mix of protocols
+    ip_proto = random.choice([1, 6, 17])
+    icmp_code = 0
+    icmp_type = 8 if ip_proto == 1 else 0
+
+    return _build_flow(
+        duration, packet_count, byte_count,
+        ip_proto=ip_proto, icmp_code=icmp_code, icmp_type=icmp_type,
         flows_to_dst=flows_to_dst,
         unique_sources_to_dst=unique_sources,
         flow_creation_rate=flow_rate,
@@ -260,6 +301,7 @@ GENERATORS = {
     'icmp_flood': generate_icmp_flood,
     'syn_flood':  generate_syn_flood,
     'udp_flood':  generate_udp_flood,
+    'borderline': generate_borderline,
 }
 
 

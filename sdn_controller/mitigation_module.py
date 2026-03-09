@@ -47,6 +47,7 @@ import sys
 import signal
 import random
 import re
+import ipaddress
 import threading
 import logging
 import logging.handlers
@@ -75,15 +76,23 @@ STATS_POLL_INTERVAL = 5
 
 # Allow ryu.conf to override via CONF object
 from ryu import cfg as ryu_cfg
-ryu_cfg.CONF.register_opt(
+ryu_cfg.CONF.register_opts([
     ryu_cfg.IntOpt('stats_poll_interval', default=5,
-                   help='Flow stats polling interval in seconds')
-)
+                   help='Flow stats polling interval in seconds'),
+    ryu_cfg.FloatOpt('confidence_threshold', default=0.7,
+                     help='ML prediction confidence cutoff (0.0-1.0)'),
+    ryu_cfg.IntOpt('block_rule_timeout', default=300,
+                   help='DROP rule auto-expiry in seconds'),
+    ryu_cfg.IntOpt('packet_in_rate_limit', default=100,
+                   help='Max PacketIn events per switch per second'),
+    ryu_cfg.IntOpt('max_macs_per_port', default=5,
+                   help='Port security: max MACs per port per switch'),
+])
 
 # Block rule priority (highest to override normal forwarding)
 BLOCK_RULE_PRIORITY = 32768
 
-# Block rule hard timeout in seconds (auto-expires)
+# Block rule hard timeout in seconds (default; overridden by ryu.conf)
 BLOCK_RULE_TIMEOUT = 300
 
 # Normal forwarding flow timeouts
@@ -140,8 +149,10 @@ class PacketInRateLimiter:
     a switch exceeds the configured rate limit.
     """
 
-    def __init__(self, rate_limit=PACKET_IN_RATE_LIMIT,
+    def __init__(self, rate_limit=None,
                  window_sec=PACKET_IN_WINDOW_SEC):
+        if rate_limit is None:
+            rate_limit = ryu_cfg.CONF.packet_in_rate_limit
         self.rate_limit = rate_limit
         self.window_sec = window_sec
         self._counters = {}
@@ -425,10 +436,15 @@ class DDoSDetectionController(app_manager.RyuApp):
             "features only. Application-layer attacks may evade detection."
         )
         self.logger.info(
-            "Config: stats_poll=%ds, confidence_threshold=%.2f, mac_age=%ds, "
-            "max_macs_per_port=%d, flow_sample_threshold=%d",
-            ryu_cfg.CONF.stats_poll_interval, CONFIDENCE_THRESHOLD,
-            MAC_AGE_TIMEOUT, MAX_MACS_PER_PORT, FLOW_SAMPLE_THRESHOLD
+            "Config: stats_poll=%ds, confidence_threshold=%.2f, "
+            "block_timeout=%ds, packet_in_rate_limit=%d, "
+            "mac_age=%ds, max_macs_per_port=%d, flow_sample_threshold=%d",
+            ryu_cfg.CONF.stats_poll_interval,
+            ryu_cfg.CONF.confidence_threshold,
+            ryu_cfg.CONF.block_rule_timeout,
+            ryu_cfg.CONF.packet_in_rate_limit,
+            MAC_AGE_TIMEOUT, ryu_cfg.CONF.max_macs_per_port,
+            FLOW_SAMPLE_THRESHOLD
         )
 
     # =========================================================================
@@ -643,8 +659,8 @@ class DDoSDetectionController(app_manager.RyuApp):
         """
         Learn a MAC address with timestamp for aging.
 
-        Also enforces port security: if a port already has
-        MAX_MACS_PER_PORT different MACs, the new MAC is rejected.
+        Also enforces port security: if a port already has the configured
+        max_macs_per_port different MACs, the new MAC is rejected.
 
         Protected by _mac_lock.
 
@@ -665,11 +681,11 @@ class DDoSDetectionController(app_manager.RyuApp):
             # Check port security limit
             port_mac_set = self._port_macs[dpid][port]
             if mac not in port_mac_set:
-                if len(port_mac_set) >= MAX_MACS_PER_PORT:
+                if len(port_mac_set) >= ryu_cfg.CONF.max_macs_per_port:
                     self.logger.warning(
                         "Port security violation on dpid=%s port=%s. "
                         "Rejecting MAC %s (limit=%d reached: %s)",
-                        dpid, port, mac, MAX_MACS_PER_PORT, port_mac_set
+                        dpid, port, mac, ryu_cfg.CONF.max_macs_per_port, port_mac_set
                     )
                     return False
                 port_mac_set.add(mac)
@@ -745,9 +761,10 @@ class DDoSDetectionController(app_manager.RyuApp):
 
         Instead of a fixed 300s, randomize within +/- 20%.
         """
+        timeout = ryu_cfg.CONF.block_rule_timeout
         return random.randint(
-            int(BLOCK_RULE_TIMEOUT * 0.8),
-            int(BLOCK_RULE_TIMEOUT * 1.2)
+            int(timeout * 0.8),
+            int(timeout * 1.2)
         )
 
     # =========================================================================
@@ -1101,6 +1118,16 @@ class DDoSDetectionController(app_manager.RyuApp):
             flow_duration_sec = stat.duration_sec
             packet_count = stat.packet_count
             byte_count = stat.byte_count
+
+            # Skip flows with negative counters (counter wrap or clock skew)
+            if flow_duration_sec < 0 or packet_count < 0 or byte_count < 0:
+                self.logger.debug(
+                    "Skipping flow with negative values: duration=%s "
+                    "packets=%s bytes=%s on dpid=%s",
+                    flow_duration_sec, packet_count, byte_count, dpid
+                )
+                continue
+
             ip_proto = stat.match.get('ip_proto', 0)
             icmp_code = stat.match.get('icmp_code', 0)
             icmp_type = stat.match.get('icmp_type', 0)
@@ -1259,7 +1286,7 @@ class DDoSDetectionController(app_manager.RyuApp):
             attack_prob = probabilities[i][1]  # P(attack)
 
             # Only act if confidence exceeds threshold
-            if attack_prob < CONFIDENCE_THRESHOLD:
+            if attack_prob < ryu_cfg.CONF.confidence_threshold:
                 continue
 
             meta = batch_metadata[i]
@@ -1335,6 +1362,17 @@ class DDoSDetectionController(app_manager.RyuApp):
 
         parser = datapath.ofproto_parser
         dpid = datapath.id
+
+        # Validate IP addresses before constructing OpenFlow match
+        try:
+            ipaddress.IPv4Address(src_ip)
+            ipaddress.IPv4Address(dst_ip)
+        except (ipaddress.AddressValueError, ValueError):
+            self.logger.warning(
+                "Invalid IP in block rule request: src=%s dst=%s on dpid=%s",
+                src_ip, dst_ip, dpid
+            )
+            return
 
         try:
             match_fields = {
