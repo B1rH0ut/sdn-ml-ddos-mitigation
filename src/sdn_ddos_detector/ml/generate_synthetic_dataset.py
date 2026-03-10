@@ -42,8 +42,7 @@ import os
 import sys
 
 # Import feature definitions from the single source of truth
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from utilities.feature_extractor import CSV_HEADERS, FEATURE_NAMES, EXPECTED_FEATURE_COUNT
+from sdn_ddos_detector.ml.feature_engineering import CSV_HEADERS, FEATURE_NAMES, EXPECTED_FEATURE_COUNT
 
 # Attempt to import tqdm for progress bar; fall back gracefully
 try:

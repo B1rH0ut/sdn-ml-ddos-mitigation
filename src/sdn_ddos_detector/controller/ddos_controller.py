@@ -43,12 +43,11 @@ import json
 import time
 import csv
 import os
-import sys
 import signal
 import random
 import re
 import ipaddress
-import threading
+import eventlet.semaphore
 import logging
 import logging.handlers
 
@@ -63,8 +62,11 @@ import logging.handlers
 _IPV4_PATTERN = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
 
 # Import feature definitions from the single source of truth
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from utilities.feature_extractor import FEATURE_NAMES, EXPECTED_FEATURE_COUNT
+from sdn_ddos_detector.ml.feature_engineering import FEATURE_NAMES, EXPECTED_FEATURE_COUNT
+from sdn_ddos_detector.utils.bounded_cache import (
+    BoundedMACTable, BoundedIPCounter, BoundedFloodHistory,
+)
+from sdn_ddos_detector.utils.logging_config import setup_logging
 
 
 # =============================================================================
@@ -310,26 +312,30 @@ class DDoSDetectionController(app_manager.RyuApp):
         """Initialize the DDoS Detection Controller."""
         super(DDoSDetectionController, self).__init__(*args, **kwargs)
 
-        # Locks for shared state accessed by multiple green threads
-        self._mac_lock = threading.Lock()
-        self._blocked_lock = threading.Lock()
-        self._datapaths_lock = threading.Lock()
-        self._flood_lock = threading.Lock()
+        # Async logging: QueueHandler + RotatingFileHandler (audit 6.2)
+        self._log_listener = setup_logging(log_dir="logs/")
 
-        # MAC address to port mapping with timestamps for aging:
+        # eventlet-safe: threading primitives block the C-level thread, freezing the entire
+        # Ryu event loop. eventlet equivalents yield cooperatively within green threads.
+        self._mac_lock = eventlet.semaphore.Semaphore(1)
+        self._blocked_lock = eventlet.semaphore.Semaphore(1)
+        self._datapaths_lock = eventlet.semaphore.Semaphore(1)
+        self._flood_lock = eventlet.semaphore.Semaphore(1)
+
+        # MAC address to port mapping with TTL-based eviction (bounded)
         # {dpid: {mac: (port, timestamp)}}
-        self.mac_to_port = {}
+        self.mac_to_port = BoundedMACTable(maxsize=4096, ttl=120)
 
-        # Port security — track MACs per port
+        # Port security — track MACs per port (bounded)
         # {dpid: {port: set(mac_addresses)}}
-        self._port_macs = {}
+        self._port_macs = BoundedMACTable(maxsize=2048, ttl=300)
 
         # Connected switch datapaths: {dpid: datapath}
         self.datapaths = {}
 
-        # Track IPs that already have active block rules
+        # Track IPs that already have active block rules (bounded)
         # {(dpid, src_ip, dst_ip, ip_proto): expiry_timestamp}
-        self.blocked_ips = {}
+        self.blocked_ips = BoundedIPCounter(maxsize=10000, ttl=300)
 
         # PacketIn rate limiter
         self._packet_in_limiter = PacketInRateLimiter()
@@ -337,8 +343,8 @@ class DDoSDetectionController(app_manager.RyuApp):
         # Flood rate limiter per switch
         self._flood_limiter = FloodRateLimiter()
 
-        # Broadcast loop prevention
-        self._flood_history = {}
+        # Broadcast loop prevention (bounded LRU)
+        self._flood_history = BoundedFloodHistory(maxsize=512)
         self._flood_suppress_window = 1.0
 
         # Graceful shutdown flag
@@ -359,9 +365,10 @@ class DDoSDetectionController(app_manager.RyuApp):
 
         # Load ML model with integrity verification
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(script_dir, '..', 'ml_model', 'flow_model.pkl')
-        scaler_path = os.path.join(script_dir, '..', 'ml_model', 'scaler.pkl')
-        hash_file_path = os.path.join(script_dir, '..', 'ml_model', MODEL_HASH_FILE)
+        ml_dir = os.path.join(script_dir, '..', 'ml')
+        model_path = os.path.join(ml_dir, 'flow_model.pkl')
+        scaler_path = os.path.join(ml_dir, 'scaler.pkl')
+        hash_file_path = os.path.join(ml_dir, MODEL_HASH_FILE)
 
         try:
             if not _verify_model_integrity(
@@ -397,8 +404,9 @@ class DDoSDetectionController(app_manager.RyuApp):
                 str(e)
             )
 
-        # Ensure logs directory exists
-        self.log_dir = os.path.join(script_dir, '..', 'logs')
+        # Ensure logs directory exists (project root /logs/)
+        project_root = os.path.join(script_dir, '..', '..', '..', '..')
+        self.log_dir = os.path.join(project_root, 'logs')
         os.makedirs(self.log_dir, exist_ok=True)
 
         # Initialize attack log header once
@@ -477,16 +485,22 @@ class DDoSDetectionController(app_manager.RyuApp):
             len(self.datapaths), len(self.blocked_ips)
         )
 
+        # Stop async log listener
+        if hasattr(self, '_log_listener') and self._log_listener is not None:
+            self._log_listener.stop()
+
     def close(self):
         """
         Clean up resources on application shutdown.
 
         Called by Ryu framework during app teardown.
-        Persists state before exit.
+        Persists state before exit and stops async log listener.
         """
         self._shutting_down = True
         self._save_state()
         self.logger.info("Controller shutting down, cleaning up resources")
+        if hasattr(self, '_log_listener') and self._log_listener is not None:
+            self._log_listener.stop()
         super(DDoSDetectionController, self).close()
 
     # =========================================================================
@@ -1413,7 +1427,11 @@ class DDoSDetectionController(app_manager.RyuApp):
     def _log_attack(self, src_ip, dst_ip, attack_type, packet_rate,
                     confidence, switch):
         """
-        Log a detected DDoS attack to the attacks_log.csv file.
+        Log a detected DDoS attack via async QueueHandler logging.
+
+        Replaces synchronous CSV file writes (audit 6.2) with standard
+        logging calls that go through the async QueueHandler and never
+        block green threads.
 
         Args:
             src_ip (str): Source IP address of the attacker.
@@ -1423,34 +1441,12 @@ class DDoSDetectionController(app_manager.RyuApp):
             confidence (float): ML model confidence.
             switch: Datapath ID of the reporting switch.
         """
-        log_file = os.path.join(self.log_dir, 'attacks_log.csv')
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-
-        # Sanitize IPs to prevent CSV injection
+        # Sanitize IPs to prevent log injection
         safe_src = self._sanitize_ip(src_ip)
         safe_dst = self._sanitize_ip(dst_ip)
 
-        try:
-            with open(log_file, 'a', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow([
-                    timestamp,
-                    safe_src,
-                    safe_dst,
-                    attack_type,
-                    f'{packet_rate:.2f}',
-                    f'{confidence:.3f}',
-                    'BLOCKED',
-                    switch
-                ])
-
-            self.logger.info(
-                "Attack logged: %s -> %s (%s, conf=%.3f) on switch %s",
-                src_ip, dst_ip, attack_type, confidence, switch
-            )
-
-        except IOError as e:
-            self.logger.error(
-                "Failed to write to attack log %s: %s",
-                log_file, str(e)
-            )
+        self.logger.info(
+            "ATTACK_LOG src=%s dst=%s type=%s pps=%.2f confidence=%.3f "
+            "action=BLOCKED switch=%s",
+            safe_src, safe_dst, attack_type, packet_rate, confidence, switch
+        )

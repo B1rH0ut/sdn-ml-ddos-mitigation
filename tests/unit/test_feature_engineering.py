@@ -1,8 +1,8 @@
-"""Tests for utilities/feature_extractor.py"""
+"""Tests for sdn_ddos_detector.ml.feature_engineering"""
 
 import pytest
 import numpy as np
-from utilities.feature_extractor import (
+from sdn_ddos_detector.ml.feature_engineering import (
     FEATURE_NAMES,
     EXPECTED_FEATURE_COUNT,
     CSV_HEADERS,

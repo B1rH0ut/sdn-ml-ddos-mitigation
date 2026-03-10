@@ -34,7 +34,7 @@ Changes from previous 10-feature set:
       at the individual flow level)
 
 Usage:
-    from utilities.feature_extractor import (
+    from sdn_ddos_detector.ml.feature_engineering import (
         FEATURE_NAMES, EXPECTED_FEATURE_COUNT, CSV_HEADERS,
         extract_flow_features, validate_features
     )
