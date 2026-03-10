@@ -1,11 +1,11 @@
-"""Tests for utilities/dataset_collector.py"""
+"""Tests for sdn_ddos_detector.utils.dataset_collector"""
 
 import os
 import csv
 import tempfile
 import pytest
-from utilities.feature_extractor import CSV_HEADERS, EXPECTED_FEATURE_COUNT
-from utilities.dataset_collector import DatasetCollector
+from sdn_ddos_detector.ml.feature_engineering import CSV_HEADERS, EXPECTED_FEATURE_COUNT
+from sdn_ddos_detector.utils.dataset_collector import DatasetCollector
 
 
 @pytest.fixture

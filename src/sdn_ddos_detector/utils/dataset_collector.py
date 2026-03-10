@@ -16,7 +16,7 @@ CSV columns (13 total = 12 features + 1 label):
 
 Usage:
     As module:
-        from utilities.dataset_collector import DatasetCollector
+        from sdn_ddos_detector.utils.dataset_collector import DatasetCollector
 
         collector = DatasetCollector('../datasets/flow_dataset.csv')
         collector.add_flow([10, 5, 30, 100, 5000, 10.0, 500.0, 6, 0, 0], label=0)
@@ -35,7 +35,7 @@ import atexit
 from datetime import datetime
 
 # Import feature definitions from the single source of truth
-from utilities.feature_extractor import (
+from sdn_ddos_detector.ml.feature_engineering import (
     CSV_HEADERS,
     EXPECTED_FEATURE_COUNT,
 )
