@@ -62,11 +62,16 @@ import logging.handlers
 _IPV4_PATTERN = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
 
 # Import feature definitions from the single source of truth
-from sdn_ddos_detector.ml.feature_engineering import FEATURE_NAMES, EXPECTED_FEATURE_COUNT
+from sdn_ddos_detector.ml.feature_engineering import (
+    FEATURE_NAMES, EXPECTED_FEATURE_COUNT,
+    extract_flow_features_from_stats, features_dict_to_array,
+)
 from sdn_ddos_detector.utils.bounded_cache import (
     BoundedMACTable, BoundedIPCounter, BoundedFloodHistory,
 )
 from sdn_ddos_detector.utils.logging_config import setup_logging
+from sdn_ddos_detector.ml.drift_detector import DriftMonitor
+from sdn_ddos_detector.ml.circuit_breaker import MLCircuitBreaker, ThresholdFallbackDetector
 
 
 # =============================================================================
@@ -215,72 +220,78 @@ class FloodRateLimiter:
         return True
 
 
-def _verify_model_integrity(model_path, scaler_path, hash_file_path, logger):
+def _verify_model_integrity(model_path, config_dir, logger):
     """
-    Verify SHA-256 integrity of model and scaler files before loading.
+    Verify model file integrity using HMAC-SHA256 or SHA-256 fallback.
 
-    Prevents loading tampered model files containing malicious
-    pickle payloads.
+    SECURITY: Returns False (refuses to load) in ALL failure cases:
+    - Hash file missing (audit 1.1: previously returned True → RCE risk)
+    - Hash mismatch
+    - HMAC key not configured (falls back to SHA-256 with warning)
 
     Args:
-        model_path (str): Path to flow_model.pkl.
-        scaler_path (str): Path to scaler.pkl.
-        hash_file_path (str): Path to model_hashes.json.
+        model_path (str): Path to the model .pkl file.
+        config_dir (str): Directory containing model_checksums.hmac.
         logger: Ryu logger instance.
 
     Returns:
-        bool: True if hashes match or hash file doesn't exist (first run).
+        bool: True only if hash matches. False in all other cases.
     """
-    if not os.path.isfile(hash_file_path):
-        logger.warning(
-            "Model hash file not found at %s. "
-            "Cannot verify model integrity. "
-            "Re-run train_model.py to generate hash file.",
-            hash_file_path
-        )
-        return True
+    import hmac as hmac_mod
 
+    hash_file = os.path.join(config_dir, "model_checksums.hmac")
+
+    if not os.path.exists(hash_file):
+        logger.critical(
+            "Model hash file MISSING at %s — REFUSING to load model. "
+            "Run: python -m sdn_ddos_detector.scripts.sign_model %s",
+            hash_file, model_path
+        )
+        return False  # NEVER return True when hash file is absent
+
+    hmac_key = os.environ.get("SDN_MODEL_HMAC_KEY", "").encode()
+    if not hmac_key:
+        logger.warning(
+            "SDN_MODEL_HMAC_KEY not set — using SHA-256 only (reduced security). "
+            "Set the environment variable for HMAC-SHA256 verification."
+        )
+
+    # Compute actual hash
     try:
-        with open(hash_file_path, 'r') as f:
-            expected_hashes = json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        logger.error("Failed to read model hash file %s: %s",
-                     hash_file_path, str(e))
+        with open(model_path, "rb") as f:
+            file_bytes = f.read()
+    except IOError as e:
+        logger.error("Failed to read model file %s: %s", model_path, str(e))
         return False
 
-    files_to_check = {
-        'flow_model.pkl': model_path,
-        'scaler.pkl': scaler_path,
-    }
+    if hmac_key:
+        actual_hash = hmac_mod.new(hmac_key, file_bytes, hashlib.sha256).hexdigest()
+    else:
+        actual_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    for filename, filepath in files_to_check.items():
-        if filename not in expected_hashes:
-            logger.error("No expected hash for %s in hash file", filename)
-            return False
+    # Load expected hash
+    try:
+        with open(hash_file, "r") as f:
+            checksums = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error("Failed to read hash file %s: %s", hash_file, str(e))
+        return False
 
-        sha256 = hashlib.sha256()
-        try:
-            with open(filepath, 'rb') as f:
-                for chunk in iter(lambda: f.read(8192), b''):
-                    sha256.update(chunk)
-        except IOError as e:
-            logger.error("Failed to read %s for hashing: %s", filepath, str(e))
-            return False
+    model_name = os.path.basename(model_path)
+    expected_hash = checksums.get(model_name)
 
-        actual_hash = sha256.hexdigest()
-        expected_hash = expected_hashes[filename]
+    if expected_hash is None:
+        logger.critical("No hash entry for %s in %s", model_name, hash_file)
+        return False
 
-        if actual_hash != expected_hash:
-            logger.critical(
-                "MODEL INTEGRITY FAILURE: %s hash mismatch! "
-                "Expected: %s, Got: %s. "
-                "Model file may have been tampered with. "
-                "Re-run train_model.py to regenerate.",
-                filename, expected_hash, actual_hash
-            )
-            return False
+    if not hmac_mod.compare_digest(actual_hash, expected_hash):
+        logger.critical(
+            "Model integrity FAILED for %s. Expected: %s..., Got: %s...",
+            model_name, expected_hash[:16], actual_hash[:16]
+        )
+        return False
 
-    logger.info("Model integrity verified (SHA-256 hashes match)")
+    logger.info("Model integrity verified for %s", model_name)
     return True
 
 
@@ -350,14 +361,12 @@ class DDoSDetectionController(app_manager.RyuApp):
         # Graceful shutdown flag
         self._shutting_down = False
 
-        # Track consecutive ML prediction failures
-        self._consecutive_ml_failures = 0
+        # ADWIN-based concept drift detection (replaces EMA, audit 4.7)
+        self.drift_monitor = DriftMonitor(delta=0.002, window_size=1000)
 
-        # Concept drift detection — track prediction distributions
-        self._prediction_history = []  # List of (timestamp, mean_attack_prob)
-        self._drift_window = 60  # seconds to accumulate before checking
-        self._drift_baseline_mean = None  # Set after first window
-        self._drift_threshold = 0.15  # Alert if mean shifts by more than this
+        # Circuit breaker for ML inference (audit 8.3)
+        self.circuit_breaker = MLCircuitBreaker(fail_max=5, reset_timeout=30)
+        self.fallback_detector = ThresholdFallbackDetector()
 
         # ML model and scaler
         self.model = None
@@ -366,18 +375,21 @@ class DDoSDetectionController(app_manager.RyuApp):
         # Load ML model with integrity verification
         script_dir = os.path.dirname(os.path.abspath(__file__))
         ml_dir = os.path.join(script_dir, '..', 'ml')
+        self.config_dir = os.path.join(script_dir, '..', 'config')
         model_path = os.path.join(ml_dir, 'flow_model.pkl')
         scaler_path = os.path.join(ml_dir, 'scaler.pkl')
-        hash_file_path = os.path.join(ml_dir, MODEL_HASH_FILE)
 
         try:
-            if not _verify_model_integrity(
-                model_path, scaler_path, hash_file_path, self.logger
-            ):
-                raise ValueError(
-                    "Model integrity verification failed. "
-                    "Refusing to load potentially tampered model files."
-                )
+            # Verify each model file independently (audit 1.1, 1.2)
+            for artifact_path in [model_path, scaler_path]:
+                if not _verify_model_integrity(
+                    artifact_path, self.config_dir, self.logger
+                ):
+                    raise ValueError(
+                        f"Model integrity verification failed for "
+                        f"{os.path.basename(artifact_path)}. "
+                        f"Refusing to load potentially tampered model files."
+                    )
 
             self.model = joblib.load(model_path)
             self.scaler = joblib.load(scaler_path)
@@ -1123,7 +1135,7 @@ class DDoSDetectionController(app_manager.RyuApp):
         # =====================================================================
         # PASS 1: Parse flows and build per-destination aggregates
         # =====================================================================
-        parsed_flows = []
+        raw_flows = []
         dst_flow_counts = {}
         dst_source_sets = {}
         dst_earliest_time = {}
@@ -1148,25 +1160,10 @@ class DDoSDetectionController(app_manager.RyuApp):
             src_ip = stat.match.get('ipv4_src', 'unknown')
             dst_ip = stat.match.get('ipv4_dst', 'unknown')
 
-            if flow_duration_sec > 0:
-                pps = packet_count / flow_duration_sec
-                bps = byte_count / flow_duration_sec
-            else:
-                pps = packet_count
-                bps = byte_count
-
-            if packet_count > 0:
-                avg_pkt_size = byte_count / packet_count
-            else:
-                avg_pkt_size = 0
-
-            parsed_flows.append({
-                'duration': flow_duration_sec,
+            raw_flows.append({
+                'duration_sec': flow_duration_sec,
                 'packet_count': packet_count,
                 'byte_count': byte_count,
-                'pps': pps,
-                'bps': bps,
-                'avg_pkt_size': avg_pkt_size,
                 'ip_proto': ip_proto,
                 'icmp_code': icmp_code,
                 'icmp_type': icmp_type,
@@ -1187,18 +1184,19 @@ class DDoSDetectionController(app_manager.RyuApp):
                         dst_earliest_time[dst_ip], flow_duration_sec
                     )
 
-        if not parsed_flows:
+        if not raw_flows:
             return
 
         # =====================================================================
-        # PASS 2: Build 12-feature vectors with aggregates, batch classify
+        # PASS 2: Extract features via single source of truth (audit 4.2, 8.1)
         # =====================================================================
         batch_features = []
         batch_metadata = []
 
-        for flow in parsed_flows:
+        for flow in raw_flows:
             dst_ip = flow['dst_ip']
 
+            # Compute aggregate features for this destination
             flows_to_dst = dst_flow_counts.get(dst_ip, 0)
             unique_sources = len(dst_source_sets.get(dst_ip, set()))
             time_window = dst_earliest_time.get(dst_ip, 0)
@@ -1207,91 +1205,46 @@ class DDoSDetectionController(app_manager.RyuApp):
             else:
                 flow_creation_rate = flows_to_dst
 
-            features = [
-                flow['duration'],
-                flow['packet_count'],
-                flow['byte_count'],
-                flow['pps'],
-                flow['bps'],
-                flow['avg_pkt_size'],
-                flow['ip_proto'],
-                flow['icmp_code'],
-                flow['icmp_type'],
-                flows_to_dst,
-                unique_sources,
-                flow_creation_rate,
-            ]
+            # Use the SINGLE SOURCE OF TRUTH for feature extraction
+            flow_with_aggregates = dict(flow)
+            flow_with_aggregates['flows_to_dst'] = flows_to_dst
+            flow_with_aggregates['unique_sources_to_dst'] = unique_sources
+            flow_with_aggregates['flow_creation_rate'] = flow_creation_rate
 
-            batch_features.append(features)
+            features_dict = extract_flow_features_from_stats(flow_with_aggregates)
+            feature_values = [features_dict[name] for name in FEATURE_NAMES]
+
+            batch_features.append(feature_values)
             batch_metadata.append({
                 'src_ip': flow['src_ip'],
                 'dst_ip': flow['dst_ip'],
                 'ip_proto': flow['ip_proto'],
-                'icmp_type': flow['icmp_type'],
-                'pps': flow['pps'],
+                'icmp_type': flow.get('icmp_type', 0),
+                'pps': features_dict['packet_count_per_second'],
             })
 
         # =====================================================================
-        # BATCH ML CLASSIFICATION with confidence threshold
+        # BATCH ML CLASSIFICATION via circuit breaker (audit 8.3)
         # =====================================================================
-        try:
-            features_array = np.array(batch_features)
-            normalized = self.scaler.transform(features_array)
-            # Use predict_proba instead of predict for confidence
-            probabilities = self.model.predict_proba(normalized)
-        except Exception as e:
-            # Track consecutive failures and alert if systematic
-            self._consecutive_ml_failures += 1
-            self.logger.error(
-                "ML batch prediction error on switch dpid=%s: %s "
-                "(consecutive failures: %d)",
-                dpid, str(e), self._consecutive_ml_failures
-            )
-            if self._consecutive_ml_failures >= 5:
-                self.logger.critical(
-                    "ML prediction has failed %d consecutive times. "
-                    "Detection may be systematically broken. "
-                    "Check model/scaler compatibility with current feature set.",
-                    self._consecutive_ml_failures
-                )
-            return
+        features_array = np.array(batch_features)
+        normalized = self.scaler.transform(features_array)
 
-        # Reset failure counter on success
-        self._consecutive_ml_failures = 0
+        def _predict(X):
+            return self.model.predict_proba(X)
 
-        # Track prediction distribution for concept drift detection
+        probabilities = self.circuit_breaker.call(
+            _predict, normalized,
+            fallback=lambda X: self.fallback_detector.detect_batch(X)
+        )
+
+        # ADWIN drift detection (audit 4.7 — replaces EMA adaptation)
         attack_probs = probabilities[:, 1]
-        mean_prob = float(attack_probs.mean())
-        now_ts = time.time()
-        self._prediction_history.append((now_ts, mean_prob))
-
-        # Trim history older than 2 * drift_window
-        cutoff = now_ts - self._drift_window * 2
-        self._prediction_history = [
-            (ts, mp) for ts, mp in self._prediction_history if ts > cutoff
-        ]
-
-        # Check for drift after accumulating enough data
-        recent = [mp for ts, mp in self._prediction_history
-                  if ts > now_ts - self._drift_window]
-        if len(recent) >= 5:
-            current_mean = sum(recent) / len(recent)
-            if self._drift_baseline_mean is None:
-                self._drift_baseline_mean = current_mean
-            else:
-                drift = abs(current_mean - self._drift_baseline_mean)
-                if drift > self._drift_threshold:
-                    self.logger.warning(
-                        "CONCEPT DRIFT: mean attack probability shifted "
-                        "from %.3f to %.3f (delta=%.3f, threshold=%.3f). "
-                        "Model may need retraining.",
-                        self._drift_baseline_mean, current_mean,
-                        drift, self._drift_threshold
-                    )
-                # Slowly adapt baseline (exponential moving average)
-                self._drift_baseline_mean = (
-                    0.95 * self._drift_baseline_mean + 0.05 * current_mean
-                )
+        mean_attack_prob = float(attack_probs.mean())
+        drift_result = self.drift_monitor.update(mean_attack_prob)
+        if drift_result.detected:
+            self.logger.warning(
+                "Concept drift detected: %s", drift_result.stats
+            )
 
         # =====================================================================
         # PROCESS PREDICTIONS with confidence threshold

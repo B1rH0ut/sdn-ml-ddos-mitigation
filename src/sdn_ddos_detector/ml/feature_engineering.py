@@ -42,6 +42,7 @@ Usage:
 """
 
 import numpy as np
+import pandas as pd
 
 
 # Feature names in exact extraction order — the canonical definition.
@@ -227,6 +228,116 @@ def features_to_dict(features):
         )
 
     return dict(zip(FEATURE_NAMES, values))
+
+
+def extract_flow_features_from_stats(flow_stats, prev_stats=None, window_seconds=5.0):
+    """
+    Extract features from raw OpenFlow flow stats.
+
+    THIS FUNCTION MUST BE CALLED BY BOTH TRAINING AND INFERENCE CODE.
+    Never reimplement these calculations elsewhere.
+
+    Args:
+        flow_stats (dict): Current flow statistics from OFPFlowStatsReply.
+            Expected keys: duration_sec, packet_count, byte_count,
+            ip_proto, icmp_code, icmp_type.
+            Optional aggregate keys: flows_to_dst, unique_sources_to_dst,
+            flow_creation_rate.
+        prev_stats (dict, optional): Previous stats for the same flow
+            (for delta-based rate calculation). If provided, rates are
+            computed from deltas rather than cumulative values.
+        window_seconds (float): Time between stats polls (default 5s).
+
+    Returns:
+        dict: Feature values keyed by FEATURE_NAMES.
+    """
+    if not isinstance(flow_stats, dict):
+        raise TypeError(
+            f"flow_stats must be a dictionary, got {type(flow_stats).__name__}"
+        )
+
+    duration_sec = flow_stats.get('duration_sec', 0)
+    packet_count = flow_stats.get('packet_count', 0)
+    byte_count = flow_stats.get('byte_count', 0)
+    ip_proto = flow_stats.get('ip_proto', 0)
+    icmp_code = flow_stats.get('icmp_code', 0)
+    icmp_type = flow_stats.get('icmp_type', 0)
+
+    # If previous stats available, compute delta-based rates
+    if prev_stats is not None and window_seconds > 0:
+        delta_packets = max(0, packet_count - prev_stats.get('packet_count', 0))
+        delta_bytes = max(0, byte_count - prev_stats.get('byte_count', 0))
+        packet_count_per_second = delta_packets / window_seconds
+        byte_count_per_second = delta_bytes / window_seconds
+    elif duration_sec > 0:
+        packet_count_per_second = packet_count / duration_sec
+        byte_count_per_second = byte_count / duration_sec
+    else:
+        packet_count_per_second = 0
+        byte_count_per_second = 0
+
+    if packet_count > 0:
+        avg_packet_size = byte_count / packet_count
+    else:
+        avg_packet_size = 0
+
+    # Aggregate features (per-destination behavior)
+    flows_to_dst = flow_stats.get('flows_to_dst', 0)
+    unique_sources_to_dst = flow_stats.get('unique_sources_to_dst', 0)
+    flow_creation_rate = flow_stats.get('flow_creation_rate', 0)
+
+    return {
+        'flow_duration_sec': duration_sec,
+        'packet_count': packet_count,
+        'byte_count': byte_count,
+        'packet_count_per_second': packet_count_per_second,
+        'byte_count_per_second': byte_count_per_second,
+        'avg_packet_size': avg_packet_size,
+        'ip_proto': ip_proto,
+        'icmp_code': icmp_code,
+        'icmp_type': icmp_type,
+        'flows_to_dst': flows_to_dst,
+        'unique_sources_to_dst': unique_sources_to_dst,
+        'flow_creation_rate': flow_creation_rate,
+    }
+
+
+def features_dict_to_array(features_dict):
+    """Convert a features dict (from extract_flow_features_from_stats) to a numpy array.
+
+    Returns:
+        numpy.ndarray: Feature array with shape (1, 12), in FEATURE_NAMES order.
+    """
+    return np.array([[features_dict[name] for name in FEATURE_NAMES]])
+
+
+def validate_feature_distributions(train_df, serve_df, threshold=0.05):
+    """Detect distribution shift between training and serving features.
+
+    Uses the Kolmogorov-Smirnov test per feature to detect whether the
+    serving data distribution has drifted from training data.
+
+    Args:
+        train_df (pd.DataFrame): Training data features.
+        serve_df (pd.DataFrame): Serving/live data features.
+        threshold (float): p-value threshold below which drift is flagged.
+
+    Returns:
+        dict: Per-feature results with statistic, p_value, and drifted flag.
+    """
+    from scipy.stats import ks_2samp
+    results = {}
+    for col in FEATURE_NAMES:
+        if col in train_df.columns and col in serve_df.columns:
+            stat, p_value = ks_2samp(
+                train_df[col].dropna(), serve_df[col].dropna()
+            )
+            results[col] = {
+                "statistic": stat,
+                "p_value": p_value,
+                "drifted": p_value < threshold,
+            }
+    return results
 
 
 if __name__ == '__main__':
