@@ -1,0 +1,24 @@
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.controller
+    ports:
+      - "6653:6653"
+      - "8080:8080"
+    volumes:
+      - ./ml_model:/app/ml_model:ro
+      - ./logs:/app/logs
+    environment:
+      - SDN_API_TOKEN=${SDN_API_TOKEN:-changeme}
+      - SDN_MODEL_HMAC_KEY=${SDN_MODEL_HMAC_KEY:-}
+    restart: unless-stopped
+
+  mininet:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mininet
+    privileged: true
+    network_mode: host
+    depends_on:
+      - controller
