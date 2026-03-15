@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Full Dataset Generator for DDoS Detection Model Training
+SYNTHETIC DATASET GENERATOR — BASELINE COMPARISON ONLY
+
+This generator creates synthetic network flow data for baseline comparison.
+Primary evaluation MUST use real datasets: CIC-IDS2017, CIC-DDoS2019, UNSW-NB15.
+
+Synthetic-only results should NOT be cited as this project's accuracy metrics.
+See datasets/README.md for real dataset download instructions.
 
 Generates a realistic synthetic dataset of network flow statistics for
 training the Random Forest DDoS detection classifier. Produces flows
 with realistic value distributions across six traffic categories.
 
-Feature definitions are imported from utilities/feature_extractor.py
-(the single source of truth).
+Feature definitions are imported from the single source of truth
+(sdn_ddos_detector.ml.feature_engineering).
 
 Normal Traffic (65%):
     - ICMP (ping):  Low-moderate packet rates, small payloads
@@ -19,6 +25,12 @@ Attack Traffic (35%):
     - SYN Flood:    500-6000 pps, tiny packets (~60 bytes)
     - UDP Flood:    600-7000 pps, high aggregate behavior
     - Borderline:   200-1500 pps, ambiguous flows near decision boundary
+
+Aggregate feature correlations:
+    - flows_to_dst scales with unique_sources_to_dst (attacks have many
+      sources targeting one destination)
+    - flow_creation_rate correlates with packet_rate for attacks (high pps
+      implies rapid flow creation)
 
 Output CSV columns (13 total = 12 features + 1 label):
     flow_duration_sec, packet_count, byte_count,
@@ -132,16 +144,48 @@ def _build_flow(duration, packet_count, byte_count, ip_proto, icmp_code,
 # Normal traffic generators
 # =============================================================================
 
+def _correlated_aggregates_normal(pps):
+    """Generate correlated aggregate features for normal traffic.
+
+    Normal traffic: few flows to destination, few unique sources,
+    low flow creation rate. Slight positive correlation between
+    flows_to_dst and unique_sources (more flows = slightly more sources).
+    """
+    # Base: 1-15 flows, sources are a subset
+    flows_to_dst = random.randint(1, 15)
+    # Sources <= flows, with noise
+    unique_sources = max(1, min(flows_to_dst, random.randint(1, max(1, int(flows_to_dst * 0.8)))))
+    # Flow creation rate loosely tied to pps (normal: low correlation)
+    flow_rate = add_noise(max(0.1, pps * random.uniform(0.0005, 0.003)), 0.1)
+    return flows_to_dst, unique_sources, flow_rate
+
+
+def _correlated_aggregates_attack(pps):
+    """Generate correlated aggregate features for attack traffic.
+
+    Attack traffic: many flows converging on one destination from many
+    unique sources. flows_to_dst scales with unique_sources (DDoS = many
+    sources). flow_creation_rate correlates with pps (high packet rate
+    implies rapid flow creation).
+    """
+    # Many unique sources (DDoS hallmark)
+    unique_sources = random.randint(10, 200)
+    # flows >= unique_sources (each source sends >= 1 flow), with noise
+    flows_to_dst = int(unique_sources * random.uniform(1.2, 2.5))
+    flows_to_dst = max(unique_sources, int(add_noise(flows_to_dst, 0.1)))
+    # Flow creation rate correlates with pps
+    flow_rate = add_noise(max(3.0, pps * random.uniform(0.005, 0.015)), 0.1)
+    return flows_to_dst, unique_sources, flow_rate
+
+
 def generate_icmp_ping():
     """Generate a single normal ICMP ping flow (12 features)."""
     duration = random.uniform(0.5, 30.0)
     packet_count = random.randint(5, 500)
     byte_count = random.randint(500, 50000)
 
-    # Normal aggregate behavior: few flows, few sources
-    flows_to_dst = random.randint(1, 15)
-    unique_sources = random.randint(1, 6)
-    flow_rate = random.uniform(0.1, 2.0)
+    pps = packet_count / max(duration, 0.001)
+    flows_to_dst, unique_sources, flow_rate = _correlated_aggregates_normal(pps)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -158,9 +202,8 @@ def generate_tcp_data():
     packet_count = random.randint(50, 10000)
     byte_count = random.randint(5000, 1000000)
 
-    flows_to_dst = random.randint(1, 25)
-    unique_sources = random.randint(1, 12)
-    flow_rate = random.uniform(0.1, 4.0)
+    pps = packet_count / max(duration, 0.001)
+    flows_to_dst, unique_sources, flow_rate = _correlated_aggregates_normal(pps)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -177,9 +220,8 @@ def generate_http_web():
     packet_count = random.randint(10, 2000)
     byte_count = random.randint(1000, 200000)
 
-    flows_to_dst = random.randint(1, 30)
-    unique_sources = random.randint(1, 15)
-    flow_rate = random.uniform(0.2, 5.0)
+    pps = packet_count / max(duration, 0.001)
+    flows_to_dst, unique_sources, flow_rate = _correlated_aggregates_normal(pps)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -202,10 +244,7 @@ def generate_icmp_flood():
     packet_count = int(pps * duration)
     byte_count = random.randint(packet_count * 60, packet_count * 120)
 
-    # Attack aggregate behavior: many flows, many sources targeting same dst
-    flows_to_dst = random.randint(20, 300)
-    unique_sources = random.randint(10, 150)
-    flow_rate = random.uniform(5.0, 60.0)
+    flows_to_dst, unique_sources, flow_rate = _correlated_aggregates_attack(pps)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -225,9 +264,7 @@ def generate_syn_flood():
     # SYN floods have tiny packets (~60 bytes each)
     byte_count = random.randint(packet_count * 40, packet_count * 80)
 
-    flows_to_dst = random.randint(30, 400)
-    unique_sources = random.randint(15, 200)
-    flow_rate = random.uniform(8.0, 80.0)
+    flows_to_dst, unique_sources, flow_rate = _correlated_aggregates_attack(pps)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -246,9 +283,7 @@ def generate_udp_flood():
     packet_count = int(pps * duration)
     byte_count = random.randint(packet_count * 50, packet_count * 150)
 
-    flows_to_dst = random.randint(25, 350)
-    unique_sources = random.randint(12, 180)
-    flow_rate = random.uniform(6.0, 70.0)
+    flows_to_dst, unique_sources, flow_rate = _correlated_aggregates_attack(pps)
 
     return _build_flow(
         duration, packet_count, byte_count,
@@ -273,10 +308,12 @@ def generate_borderline():
     packet_count = int(pps * duration)
     byte_count = random.randint(packet_count * 50, packet_count * 200)
 
-    # Moderate aggregate behavior: between normal and attack
-    flows_to_dst = random.randint(10, 80)
+    # Borderline: between normal and attack aggregate behavior
+    # Use a blend — some correlation but weaker than pure attack
+    pps = packet_count / max(duration, 0.001)
     unique_sources = random.randint(5, 40)
-    flow_rate = random.uniform(2.0, 20.0)
+    flows_to_dst = max(unique_sources, int(unique_sources * random.uniform(1.0, 2.0)))
+    flow_rate = add_noise(max(1.0, pps * random.uniform(0.002, 0.01)), 0.15)
 
     # Mix of protocols
     ip_proto = random.choice([1, 6, 17])
