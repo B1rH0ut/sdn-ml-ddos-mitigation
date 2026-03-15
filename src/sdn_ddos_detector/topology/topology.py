@@ -151,7 +151,7 @@ def print_topology_info(net):
     print("\n[CONTROLLER INFORMATION]")
     print("  Address:  127.0.0.1:6653")
     print("  Protocol: OpenFlow 1.3")
-    print("  Note:     Network will continue even if controller is not reachable")
+    print("  Note:     Switches use fail-mode=secure (drop traffic if controller down)")
 
     print("\n[SWITCHES]")
     for switch in net.switches:
@@ -226,21 +226,20 @@ def create_network(spine_count=2, leaf_count=3, host_count=10):
     info('*** Starting network\n')
     net.start()
 
-    # Enable STP on all switches to prevent broadcast loops.
-    # The spine-leaf topology has multiple paths between leaves via spines.
-    # Without STP, broadcast/flood frames loop infinitely between switches.
-    info('*** Enabling STP on all switches for loop prevention\n')
+    # Set fail-mode=secure on all switches (audit 3.3)
+    # In secure mode, switches drop all traffic when controller is unreachable,
+    # preventing an unprotected network when the DDoS detection controller is down.
+    # Loop prevention is handled by ECMP group tables in the controller (audit 5.1),
+    # not by STP which blocks redundant paths.
+    info('*** Setting fail-mode=secure on all switches\n')
     for switch in net.switches:
         switch_name = switch.name
-        # Enable STP on the OVS bridge
-        os.system(f'ovs-vsctl set bridge {switch_name} stp_enable=true')
-        info(f'  STP enabled on {switch_name}\n')
+        os.system(f'ovs-vsctl set-fail-mode {switch_name} secure')
+        info(f'  fail-mode=secure on {switch_name}\n')
 
-    # Allow time for STP convergence (ports move through
-    # listening -> learning -> forwarding states)
-    info('*** Waiting for STP convergence (15 seconds)...\n')
+    # Brief pause for OVS configuration to apply
     import time
-    time.sleep(15)
+    time.sleep(2)
 
     info('*** Network started successfully!\n')
 
