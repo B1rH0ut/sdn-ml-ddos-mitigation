@@ -1,0 +1,23 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    mininet \
+    openvswitch-switch \
+    openvswitch-common \
+    iproute2 \
+    hping3 \
+    iperf \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml .
+COPY src/ src/
+
+RUN pip3 install --no-cache-dir .
+
+CMD ["python3", "-m", "sdn_ddos_detector.topology.topology"]
