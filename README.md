@@ -1,60 +1,80 @@
 # SDN-Based DDoS Detection and Mitigation with Machine Learning
 
-An intelligent network security system that combines **Software-Defined Networking (SDN)** with a **Random Forest classifier** to detect and automatically mitigate DDoS attacks in real time. Built on a Ryu OpenFlow controller and tested on a Mininet-emulated spine-leaf data center topology.
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Tests: 91 passing](https://img.shields.io/badge/tests-91%20passing-brightgreen)
+
+An intelligent network security system that combines **Software-Defined Networking (SDN)** with a **Random Forest classifier** to detect and automatically mitigate DDoS attacks in real time. Validated on three real-world datasets (CIC-IDS2017, CIC-DDoS2019, UNSW-NB15) and hardened against 44 of 56 audit findings. Built on a Ryu OpenFlow 1.3 controller with two-stage detection (threshold fast-path + ML), ECMP load balancing, and network-wide mitigation across a spine-leaf topology.
 
 > Capstone project: Computer Engineering (Networking)
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/B1rH0ut/sdn-ml-ddos-mitigation.git
+cd sdn-ml-ddos-mitigation
+make setup       # pip install -e ".[dev,ml]"
+make train       # Train RF model on synthetic dataset
+make run         # Start Ryu SDN controller
+```
 
 ---
 
 ## How It Works
 
 ```
-                    ┌─────────────────────────────────┐
-                    │       Application Layer         │
-                    │    Random Forest Classifier     │
-                    │  12 flow features · Scaler ·    │
-                    │  Confidence threshold (0.7)     │
-                    └───────────────┬─────────────────┘
-                                    │ predict_proba()
-                    ┌───────────────▼─────────────────┐
-                    │        Control Layer            │
-                    │   Ryu SDN Controller (OF 1.3)   │
-                    │  MAC learning · Stats polling   │
-                    │  Rate limiting · Loop prevention│
-                    │  SHA-256 model verification     │
-                    └───────────────┬─────────────────┘
-                                    │ OpenFlow 1.3
-                    ┌───────────────▼─────────────────┐
-                    │         Data Layer              │
-                    │   Mininet Spine-Leaf Topology   │
-                    │  Configurable switches & hosts  │
-                    │  STP enabled · 100Mbps links    │
-                    └─────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+                    │         Application Layer           │
+                    │   Two-Stage Detection Pipeline      │
+                    │  Threshold fast-path (immediate)    │
+                    │  RF predict_proba() (confidence≥0.7)│
+                    │  Circuit breaker + ADWIN drift      │
+                    │  HMAC-SHA256 model verification     │
+                    └────────────────┬────────────────────┘
+                                     │ predict / block
+                    ┌────────────────▼────────────────────┐
+                    │          Control Layer              │
+                    │    Ryu SDN Controller (OF 1.3)      │
+                    │  TLS channel · MAC learning · ECMP  │
+                    │  Rate limiting · API auth · BCP38   │
+                    │  3s stats polling · async logging   │
+                    └────────────────┬────────────────────┘
+                                     │ OpenFlow 1.3 (TLS)
+                    ┌────────────────▼────────────────────┐
+                    │           Data Layer               │
+                    │    Mininet Spine-Leaf Topology      │
+                    │  ECMP uplinks · Anti-spoofing rules │
+                    │  Network-wide DROP · Bounded caches │
+                    └─────────────────────────────────────┘
 ```
 
-1. The **Ryu controller** manages a spine-leaf network with STP-enabled OpenFlow switches
-2. Every **5 seconds** (configurable via `ryu.conf`), it collects flow statistics from all switches
-3. **12 features** are extracted per flow, including per-destination aggregate behavior
-4. Features are **batched** and classified by a **Random Forest model** using `predict_proba()`
-5. Flows exceeding the **confidence threshold** (default 0.7) trigger a specific **DROP rule** on the switch
-6. The controller verifies **SHA-256 model integrity** before loading to prevent tampering
-7. All detections are **logged** to CSV with sanitized inputs
-
-The controller gracefully degrades to a standard L2 switch if the ML model is not loaded.
+1. The **Ryu controller** manages a spine-leaf network with ECMP load-balanced uplinks
+2. Every **3 seconds**, it collects flow statistics from all switches
+3. **Threshold fast-path** catches obvious volumetric attacks immediately
+4. **12 features** are extracted per flow, including per-destination aggregate behavior
+5. Features are **batched** and classified by a **Random Forest model** using `predict_proba()`
+6. Flows exceeding the **confidence threshold** (0.7) trigger **network-wide DROP rules** on all switches
+7. **HMAC-SHA256** model integrity verification prevents pickle deserialization attacks
+8. **Circuit breaker** falls back to threshold-only detection if ML inference fails
 
 ---
 
 ## Detection Pipeline
 
 ```
-Flow Stats Reply
+Flow Stats Reply (all switches, every 3s)
         │
         ▼
 ┌──────────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Filter & Map │──▶ │ Aggregate    │──▶ │ Batch Scale   │──▶ │ RF Predict   │──▶ │ DROP / Allow │
-│  IPv4 flows  │    │ per-dst stats│    │ StandardScaler│    │ predict_proba│    │ + Log to CSV │
-│  + sampling  │    │ 12 features  │    │  (σ, μ)       │    │ threshold≥0.7│    │ + syslog     │
+│ Filter & Map │──▶ │ Threshold    │──▶ │ Batch Scale   │──▶ │ RF Predict   │──▶ │ Network-wide │
+│  IPv4 flows  │    │ Fast-Path    │    │ StandardScaler│    │ predict_proba│    │ DROP + Log   │
+│  + sampling  │    │ (immediate)  │    │  (σ, μ)       │    │ threshold≥0.7│    │ all switches │
 └──────────────┘    └──────────────┘    └───────────────┘    └──────────────┘    └──────────────┘
+                     │ ATTACK                                  │ confidence
+                     ▼ (bypass ML)                             ▼ < 0.7
+                   DROP                                      ALLOW
 ```
 
 **Features extracted per flow (12):**
@@ -74,9 +94,20 @@ Flow Stats Reply
 | 11 | `unique_sources_to_dst`  | Unique source IPs targeting same destination |
 | 12 | `flow_creation_rate`     | New flows per second to same destination     |
 
-Features 10–12 are **aggregate behavior features** that capture DDoS patterns invisible at the individual flow level (e.g., many sources flooding one target).
+Features 10-12 are **aggregate behavior features** that capture DDoS patterns invisible at the individual flow level. All feature definitions live in `sdn_ddos_detector.ml.feature_engineering` — the single source of truth.
 
-All feature definitions live in `utilities/feature_extractor.py` — the single source of truth imported by every module.
+---
+
+## Validated Datasets
+
+| Dataset | Records | Attack Types | Citation |
+|---------|---------|-------------|----------|
+| CIC-IDS2017 | 2,830,743 | Brute Force, DoS, DDoS, Web Attack, Infiltration, Botnet | Sharafaldin et al., 2018 |
+| CIC-DDoS2019 | 50,063,112 | LDAP, MSSQL, NetBIOS, SYN, UDP, DNS amplification | Sharafaldin et al., 2019 |
+| UNSW-NB15 | 2,540,044 | Fuzzers, Analysis, Backdoors, DoS, Exploits, Reconnaissance, Shellcode, Worms | Moustafa & Slay, 2015 |
+| Synthetic | 505,433 | ICMP Flood, SYN Flood, UDP Flood | Generated via `make train` |
+
+Dataset adapters automatically map each dataset's columns to the 12-feature schema. Download real datasets with `make download-data`.
 
 ---
 
@@ -94,12 +125,11 @@ All feature definitions live in `utilities/feature_extractor.py` — the single 
               h7
 ```
 
-- **5 OpenFlow 1.3 switches** in a 2-tier spine-leaf (Clos) architecture (default; configurable)
-- **Full mesh** between tiers — every leaf connects to every spine
-- **10 hosts** (10.0.0.1–10, /24) distributed across leaf switches (default; configurable)
+- **5 OpenFlow 1.3 switches** in a 2-tier spine-leaf (Clos) architecture
+- **ECMP load balancing** via group tables across all spine uplinks
+- **BCP38 anti-spoofing** rules installed at leaf switch ingress
 - **100 Mbps** links with **5 ms** delay
-- **STP enabled** on all switches for loop prevention (15s convergence wait)
-- **Configurable** via CLI: `sudo python3 topology.py --spines 4 --leaves 6 --hosts 50`
+- **Configurable** via CLI: `sudo python -m sdn_ddos_detector.topology.topology --spines 4 --leaves 6 --hosts 50`
 
 ---
 
@@ -107,236 +137,170 @@ All feature definitions live in `utilities/feature_extractor.py` — the single 
 
 | Feature | Description |
 |---------|-------------|
-| SHA-256 model verification | Validates `.pkl` integrity before loading (prevents pickle RCE) |
+| HMAC-SHA256 model verification | Keyed hash verification before `joblib.load()` (prevents pickle RCE) |
+| TLS OpenFlow channel | Encrypted controller-switch communication |
+| API token authentication | Bearer token required for REST API access |
+| BCP38 anti-spoofing | Ingress filtering at leaf switches blocks spoofed source IPs |
+| Destination-based blocking | DROP rules match `(src_ip, dst_ip, ip_proto)` tuples |
+| Network-wide mitigation | DROP rules installed on ALL switches, not just ingress |
+| ECMP load balancing | Group tables distribute traffic across spine uplinks |
+| Circuit breaker | Isolates ML failures; falls back to threshold detection |
+| ADWIN drift detection | Monitors prediction distribution for concept drift |
 | PacketIn rate limiting | Per-switch throttling prevents controller DoS |
 | Flood rate limiting | Per-switch broadcast caps prevent amplification |
-| Broadcast loop suppression | Duplicate flood tracking + STP on all switches |
-| MAC table aging | Entries auto-expire after 300s to prevent unbounded growth |
+| Bounded caches | Fixed-size MAC tables, IP counters, flood history |
+| MAC table aging | Entries auto-expire after 300s |
 | Port security | Maximum 5 MACs per port per switch |
-| ML confidence threshold | Only blocks flows with attack probability above 0.7 |
-| Specific DROP rules | Matches `(src_ip, dst_ip, ip_proto)` tuples, not entire source IPs |
-| Randomized block timeouts | ±20% variation prevents predictable attack windows |
-| CSV log sanitization | IP validation prevents injection in attack logs |
+| ML confidence threshold | Only blocks flows with attack probability >= 0.7 |
 | Localhost-only bindings | OpenFlow and REST API bound to `127.0.0.1` |
 | Graceful shutdown | SIGTERM/SIGINT handlers persist state before exit |
-| Thread-safe shared state | Explicit locks on all shared data structures |
-| Concept drift detection | Monitors prediction distribution shifts over time |
-
----
-
-## Expected Output
-
-### Model Training
-
-Running `python3 train_model.py` produces:
-
-```
-======================================================================
-  STEP 5: Evaluating Model Performance (holdout test set)
-======================================================================
-
-  Accuracy:      0.XXXX (XX.X%)
-  Precision:     0.XXXX (XX.X%)
-  Recall:        0.XXXX (XX.X%)
-  F1-Score:      0.XXXX (XX.X%)
-  ROC AUC:       0.XXXX
-
-  Confusion Matrix:
-                    Predicted
-                  Normal  Attack
-    Actual Normal   XXXXX   XXXXX
-    Actual Attack   XXXXX   XXXXX
-
-  Feature Importance (top contributors):
-    packet_count_per_second        0.XXXX ##############
-    byte_count_per_second          0.XXXX ###########
-    flows_to_dst                   0.XXXX ########
-    ...
-
-======================================================================
-  STEP 5b: Baseline Comparison
-======================================================================
-  Model                            Accuracy  Precision   Recall       F1
-  PPS Threshold (best)              0.XXXX     0.XXXX   0.XXXX   0.XXXX
-  Majority Class (always normal)    0.XXXX     0.XXXX   0.XXXX   0.XXXX
-  Logistic Regression               0.XXXX     0.XXXX   0.XXXX   0.XXXX
-  Random Forest (ours)              0.XXXX     0.XXXX   0.XXXX   0.XXXX
-```
-
-The training script also runs **5-fold cross-validation**, **baseline comparison** (majority class, logistic regression, PPS threshold), and **adversarial robustness testing** at multiple noise levels.
-
-### Live Detection
-
-When an attack is detected, the controller logs:
-
-```
-DDoS ATTACK DETECTED on switch dpid=5: src=10.0.0.3 dst=10.0.0.7 type=ICMP Flood pps=12847.3 confidence=0.983
-ATTACK BLOCKED: DROP rule installed for src=10.0.0.3 dst=10.0.0.7 proto=1 on switch dpid=5 (expires in 287s)
-```
-
-| Detection Parameter     | Value                                     |
-|-------------------------|--------------------------------------------|
-| Flow polling interval   | 5 seconds (configurable via `ryu.conf`)    |
-| Block rule priority     | 32768                                      |
-| Block rule duration     | ~300 seconds (randomized ±20%)             |
-| Confidence threshold    | 0.7 (configurable)                         |
-| Supported attack types  | ICMP Flood, SYN Flood, UDP Flood           |
-
----
-
-## Tech Stack
-
-| Component               | Technology                                                  |
-|-------------------------|-------------------------------------------------------------|
-| SDN Controller          | Ryu 4.34 (OpenFlow 1.3)                                    |
-| Network Emulation       | Mininet 2.3+ with Open vSwitch                             |
-| ML Classifier           | scikit-learn Random Forest (100 trees, depth 20, balanced)  |
-| Feature Scaling         | StandardScaler (fit on training data only)                  |
-| Model Integrity         | SHA-256 hash verification before loading                    |
-| Attack Simulation       | hping3 (ICMP, SYN, UDP floods)                             |
-| Traffic Generation      | iperf, wget, ping                                          |
-| Testing                 | pytest (34 tests)                                          |
-| Performance Monitoring  | psutil                                                     |
-| Language                | Python 3.8+ / Bash                                        |
 
 ---
 
 ## Project Structure
 
 ```
-├── sdn_controller/
-│   ├── mitigation_module.py    # Ryu controller with ML-based DDoS detection
-│   └── ryu.conf                # Controller configuration (bindings, polling interval)
-│
-├── network_topology/
-│   ├── topology.py             # Mininet spine-leaf topology (configurable size)
-│   └── ovs_config.sh           # Open vSwitch configuration (standalone fail-mode)
-│
-├── ml_model/
-│   ├── train_model.py          # RF training, cross-validation, baselines, adversarial tests
-│   └── create_roc.py           # ROC curve visualization
-│
-├── traffic_generation/
-│   ├── generate_normal.py      # Normal traffic generator (ICMP, TCP, HTTP)
-│   └── attack_generator.sh     # DDoS attack simulator using hping3
-│
-├── datasets/
-│   ├── generate_full_dataset.py  # Synthetic 12-feature flow dataset generator
-│   └── dataset_info.txt          # Dataset specification
-│
-├── utilities/
-│   ├── feature_extractor.py    # Feature definitions — single source of truth (12 features)
-│   ├── dataset_collector.py    # Buffered CSV collection with file locking
-│   └── performance_monitor.py  # Controller CPU/memory/flow monitoring
+├── src/sdn_ddos_detector/
+│   ├── controller/
+│   │   ├── ddos_controller.py     # Ryu controller: L2 learning + ML detection + mitigation
+│   │   └── api_auth.py            # REST API token authentication
+│   ├── ml/
+│   │   ├── feature_engineering.py # 12-feature definition (single source of truth)
+│   │   ├── train.py               # RF training, cross-validation, baselines
+│   │   ├── evaluation.py          # ROC curves, performance metrics
+│   │   ├── circuit_breaker.py     # ML failure isolation with threshold fallback
+│   │   ├── drift_detector.py      # ADWIN-based concept drift monitoring
+│   │   ├── generate_synthetic_dataset.py  # Synthetic flow dataset generator
+│   │   └── dataset_adapters/      # CIC-IDS2017, CIC-DDoS2019, UNSW-NB15
+│   ├── config/
+│   │   └── topology_config.py     # ECMP groups, port mappings, priorities
+│   ├── topology/
+│   │   └── topology.py            # Mininet spine-leaf network creation
+│   ├── traffic/
+│   │   └── generate_normal.py     # Normal traffic generator
+│   ├── utils/
+│   │   ├── bounded_cache.py       # Memory-safe MAC/IP/flood tables
+│   │   ├── dataset_collector.py   # Buffered CSV collection
+│   │   ├── logging_config.py      # Structured async logging setup
+│   │   └── performance_monitor.py # CPU/memory/flow monitoring
+│   ├── scripts/
+│   │   ├── sign_model.py          # HMAC-SHA256 model signing
+│   │   └── analyze_logs.py        # Post-run log analysis
+│   └── datasets/
+│       └── download_datasets.py   # Real dataset downloader
 │
 ├── tests/
-│   ├── test_feature_extractor.py  # 18 tests for feature extraction and validation
-│   └── test_dataset_collector.py  # 16 tests for dataset collection
+│   ├── unit/                      # 84 unit tests
+│   └── adversarial/               # 7 adversarial robustness tests
 │
-├── logs/
-│   ├── init_logs.sh            # Log file initialization (640 permissions)
-│   └── analyze_logs.py         # Post-run analysis and reporting
+├── docker/
+│   ├── Dockerfile.controller      # Controller container
+│   ├── Dockerfile.mininet         # Mininet container (Linux only)
+│   └── README.md                  # Docker setup guide
 │
-├── AUDIT_REPORT.md             # Security audit findings (56 items)
-├── CHANGELOG.md                # Version history
-└── requirements.txt            # Python dependencies
+├── docs/
+│   ├── ARCHITECTURE.md            # System architecture and design decisions
+│   ├── SECURITY.md                # Security model and hardening guide
+│   ├── KNOWN_LIMITATIONS.md       # Known limitations and future work
+│   └── AUDIT_REPORT.md            # 56-item security audit findings
+│
+├── docker-compose.yml             # Multi-container orchestration
+├── Makefile                       # Build, test, run targets
+├── pyproject.toml                 # Package config and dependencies
+├── CHANGELOG.md                   # Version history
+└── LICENSE                        # MIT License
 ```
 
 ---
 
-## Quick Start
+## Tech Stack
 
-### Prerequisites
+| Component               | Technology                                                    |
+|-------------------------|---------------------------------------------------------------|
+| SDN Controller          | Ryu 4.34 (OpenFlow 1.3)                                      |
+| Network Emulation       | Mininet 2.3+ with Open vSwitch                               |
+| ML Classifier           | scikit-learn Random Forest (100 trees, depth 20, balanced)    |
+| Feature Scaling         | StandardScaler (fit on training data only)                    |
+| Model Integrity         | HMAC-SHA256 verification before loading                       |
+| Drift Detection         | River (ADWIN)                                                 |
+| Adversarial Testing     | Adversarial Robustness Toolbox (ART)                          |
+| Concurrency             | eventlet green threads                                        |
+| Logging                 | structlog with async handlers                                 |
+| Attack Simulation       | hping3 (ICMP, SYN, UDP floods)                               |
+| Traffic Generation      | iperf, wget, ping                                             |
+| Testing                 | pytest (91 tests)                                             |
+| Linting                 | ruff                                                          |
+| Containerization        | Docker + Docker Compose                                       |
+| Language                | Python 3.10+                                                  |
 
-Ubuntu 20.04+ with root access. Install system dependencies:
+---
+
+## Docker
+
+Run the full system in containers:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y mininet openvswitch-switch hping3 iperf python3 python3-pip
+# Build images
+docker compose build
+
+# Set environment variables
+export SDN_API_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+export SDN_MODEL_HMAC_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+
+# Start controller and network
+docker compose up -d
+
+# View logs
+docker compose logs -f controller
+
+# Stop
+docker compose down
 ```
 
-### Installation
+See [`docker/README.md`](docker/README.md) for details. Note: the Mininet container requires Linux with `--privileged` mode.
 
-```bash
-git clone https://github.com/B1rH0ut/sdn-ml-ddos-mitigation.git
-cd sdn-ml-ddos-mitigation
-pip3 install -r requirements.txt
-```
+---
 
-### Run
+## Documentation
 
-**1. Generate dataset and train model:**
+- [Architecture](docs/ARCHITECTURE.md) — system design, component diagrams, design decisions
+- [Security](docs/SECURITY.md) — defense layers, hardening checklist, vulnerability reporting
+- [Known Limitations](docs/KNOWN_LIMITATIONS.md) — fundamental limits and future work
+- [Changelog](CHANGELOG.md) — version history
+- [Audit Report](docs/AUDIT_REPORT.md) — 56-item security audit findings
 
-```bash
-cd datasets && python3 generate_full_dataset.py --total 505433 && cd ..
-cd ml_model && python3 train_model.py && cd ..
-```
+---
 
-This generates `flow_model.pkl`, `scaler.pkl`, and `model_hashes.json` (integrity hashes).
+## Citation
 
-**2. Start the controller** (Terminal 1):
-
-```bash
-cd sdn_controller && ryu-manager mitigation_module.py
-```
-
-**3. Start the network** (Terminal 2):
-
-```bash
-cd network_topology && sudo python3 topology.py
-```
-
-**4. Generate traffic** (Terminal 3 — normal):
-
-```bash
-cd traffic_generation && sudo python3 generate_normal.py --duration 300
-```
-
-**5. Launch an attack** (Terminal 4):
-
-```bash
-cd traffic_generation && sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --duration 60
-```
-
-**6. Watch the controller terminal** for detection and mitigation logs.
-
-### Supported Attack Types
-
-```bash
-# ICMP Flood
-sudo bash attack_generator.sh --type icmp --target 10.0.0.7 --duration 60
-
-# SYN Flood
-sudo bash attack_generator.sh --type syn --target 10.0.0.5 --duration 60
-
-# UDP Flood
-sudo bash attack_generator.sh --type udp --target 10.0.0.3 --duration 60
-
-# All types sequentially
-sudo bash attack_generator.sh --type all --target 10.0.0.7 --duration 30
-```
-
-### Run Tests
-
-```bash
-python3 -m pytest tests/ -v
+```bibtex
+@misc{sdn-ml-ddos-2026,
+  author       = {Abdullah Al-Hout},
+  title        = {{SDN}-Based {DDoS} Detection and Mitigation with Machine Learning},
+  year         = {2026},
+  howpublished = {\url{https://github.com/B1rH0ut/sdn-ml-ddos-mitigation}},
+  note         = {v3.0.0 — Research-grade SDN DDoS detection validated on CIC-IDS2017, CIC-DDoS2019, UNSW-NB15}
+}
 ```
 
 ---
 
 ## Troubleshooting
 
-| Problem                            | Solution                                               |
-|------------------------------------|--------------------------------------------------------|
-| `ryu-manager: command not found`   | `pip3 install ryu==4.34`                               |
-| `ML model files not found` warning | Run `cd ml_model && python3 train_model.py` first      |
-| Model integrity verification fails | Re-run `train_model.py` to regenerate model and hashes |
-| `This script must be run as root`  | Use `sudo` for topology.py and traffic scripts         |
-| Mininet cleanup errors             | Run `sudo mn -c` then restart topology                 |
-| `pingall` shows packet loss        | Wait 15s for STP convergence, then retry               |
-| `hping3: command not found`        | `sudo apt-get install hping3`                          |
-| No switch connections              | Ensure controller is running *before* starting network |
-| Low model accuracy                 | Use larger dataset (50,000+ flows)                     |
+| Problem                              | Solution                                                      |
+|--------------------------------------|---------------------------------------------------------------|
+| `ryu-manager: command not found`     | `make setup` or `pip install -e ".[dev,ml]"`                  |
+| `ML model files not found` warning   | Run `make train` first                                        |
+| Model integrity verification fails   | Re-run `make train` then `python -m sdn_ddos_detector.scripts.sign_model` |
+| HMAC key not set                     | `export SDN_MODEL_HMAC_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")` |
+| API auth fails                       | `export SDN_API_TOKEN=your-token`                             |
+| TLS not working                      | Set `SDN_TLS_CERT` and `SDN_TLS_KEY` env vars                |
+| `This script must be run as root`    | Use `sudo` for topology and traffic scripts                   |
+| Mininet cleanup errors               | Run `sudo mn -c` then restart topology                        |
+| `pingall` shows packet loss          | Wait 15s for ECMP group table setup, then retry               |
+| `hping3: command not found`          | `sudo apt-get install hping3`                                 |
+| No switch connections                | Ensure controller is running *before* starting network        |
+| Docker Mininet fails on macOS        | Mininet container requires Linux host (no macOS support)      |
 
 ---
 
