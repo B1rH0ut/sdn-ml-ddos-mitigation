@@ -37,6 +37,7 @@ from mininet.link import TCLink
 import argparse
 import os
 import sys
+import glob as glob_mod
 
 
 class SpineLeafTopology(Topo):
@@ -279,6 +280,9 @@ def main():
                         help='Number of leaf switches (default: 3)')
     parser.add_argument('--hosts', type=int, default=10,
                         help='Number of hosts (default: 10)')
+    parser.add_argument('--tls', action='store_true',
+                        help='Use ssl: instead of tcp: for controller '
+                             '(requires TLS certs from setup_tls.sh)')
     args = parser.parse_args()
 
     if args.spines < 1 or args.leaves < 1 or args.hosts < 1:
@@ -289,6 +293,18 @@ def main():
     setLogLevel('info')
 
     try:
+        # Warn if --tls requested but certs not found
+        if args.tls:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            tls_dir = os.path.join(script_dir, '..', 'config', 'tls')
+            if not os.path.isdir(tls_dir) or not glob_mod.glob(
+                os.path.join(tls_dir, '*.pem')
+            ):
+                print("WARNING: --tls specified but no certificates found in "
+                      f"{tls_dir}")
+                print("Run: sudo bash scripts/setup_tls.sh first")
+                sys.exit(1)
+
         # Create and run the network
         create_network(args.spines, args.leaves, args.hosts)
 

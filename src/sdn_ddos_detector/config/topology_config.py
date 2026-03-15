@@ -61,3 +61,32 @@ FLOW_TABLE_WARNING_PCT = 0.80    # Log warning at 80%
 FLOW_TABLE_CRITICAL_PCT = 0.95   # Emergency eviction at 95%
 FLOW_TABLE_CHECK_INTERVAL = 30   # Seconds between checks
 FLOW_TABLE_DEFAULT_MAX = 2000    # Default max entries (OVS default varies)
+
+# Anti-spoofing: allowed source IP per host-facing port (audit 1.3, 5.5)
+# {leaf_dpid: {port: (allowed_ip, allowed_mask)}}
+# BCP38: only allow packets from the expected source IP on each port
+HOST_PORT_ALLOWED_IPS = {
+    3: {
+        1: ('10.0.0.1', '255.255.255.255'),
+        2: ('10.0.0.2', '255.255.255.255'),
+        3: ('10.0.0.3', '255.255.255.255'),
+    },
+    4: {
+        1: ('10.0.0.4', '255.255.255.255'),
+        2: ('10.0.0.5', '255.255.255.255'),
+        3: ('10.0.0.6', '255.255.255.255'),
+        4: ('10.0.0.7', '255.255.255.255'),
+    },
+    5: {
+        1: ('10.0.0.8', '255.255.255.255'),
+        2: ('10.0.0.9', '255.255.255.255'),
+        3: ('10.0.0.10', '255.255.255.255'),
+    },
+}
+
+# Anti-spoofing priority constants
+PRIORITY_ANTI_SPOOF_ALLOW = 50   # ALLOW matching source IP
+PRIORITY_ANTI_SPOOF_DROP = 40    # DROP all other IP (catches spoofed)
+
+# Destination-based blocking cookie (for spoofed-source DDoS)
+BLOCK_DST_COOKIE = 0xBEEF
