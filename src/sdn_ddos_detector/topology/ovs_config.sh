@@ -10,8 +10,8 @@
 # Switches configured: s1, s2 (spine), s3, s4, s5 (leaf)
 # Controller: tcp:127.0.0.1:6653
 # Protocol: OpenFlow 1.3
-# Fail-mode: standalone (switches forward independently if controller disconnected)
-# Changed from 'secure' to prevent total network blackout on controller failure
+# Fail-mode: secure (switches DROP traffic if controller disconnected)
+# Prevents unprotected network when DDoS detection controller is down (audit 3.3)
 #
 # Usage:
 #     sudo bash ovs_config.sh
@@ -132,12 +132,12 @@ configure_switch() {
         return 1
     fi
 
-    # Set fail-mode to standalone
-    # In standalone mode, switches forward traffic independently if controller is unreachable
-    # Prevents total network blackout on controller failure
-    echo -e "  → Setting fail-mode to standalone"
-    if ovs-vsctl set-fail-mode "$switch" standalone 2>/dev/null; then
-        echo -e "    ${GREEN}✓${NC} Fail-mode set to standalone"
+    # Set fail-mode to secure (audit 3.3)
+    # In secure mode, switches DROP traffic if controller is unreachable
+    # Prevents unprotected network when DDoS detection controller is down
+    echo -e "  → Setting fail-mode to secure"
+    if ovs-vsctl set-fail-mode "$switch" secure 2>/dev/null; then
+        echo -e "    ${GREEN}✓${NC} Fail-mode set to secure"
     else
         echo -e "    ${RED}✗${NC} Failed to set fail-mode"
         return 1
@@ -208,7 +208,7 @@ display_summary() {
     echo ""
     echo "Controller Address:    ${CONTROLLER_ADDR}"
     echo "OpenFlow Protocol:     OpenFlow13"
-    echo "Fail-mode:             standalone"
+    echo "Fail-mode:             secure"
     echo "Statistics:            Enabled"
     echo ""
     echo "Switches configured:"
@@ -257,7 +257,7 @@ clean_configuration() {
         if check_switch_exists "$switch"; then
             echo -e "  → Cleaning ${switch}"
             ovs-vsctl del-controller "$switch" 2>/dev/null
-            ovs-vsctl set-fail-mode "$switch" standalone 2>/dev/null
+            ovs-vsctl set-fail-mode "$switch" secure 2>/dev/null
             echo -e "    ${GREEN}✓${NC} ${switch} cleaned"
         fi
     done
