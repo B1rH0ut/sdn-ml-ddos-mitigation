@@ -192,9 +192,14 @@ class TestAdversarialRobustness:
         print(f"  Feature mask: {evaded_masked}/{total_attacks} evaded "
               f"(top-3: {[FEATURE_NAMES[i] for i in top3_indices]})")
 
-        # Mimicry should evade most detections (this tests the model's weakness)
-        # Feature masking should evade some but not all
-        # We just assert these tests run without error — results are informational
+        # Lenient thresholds — goal is detecting catastrophic failure, not
+        # demanding high adversarial robustness from a Random Forest classifier.
+        recall_lowslow = 1 - (evaded_lowslow / total_attacks)
+        recall_mimicry = 1 - (evaded_mimicry / total_attacks)
+        recall_masked = 1 - (evaded_masked / total_attacks)
+        assert recall_lowslow >= 0.3, f"Low-and-slow recall catastrophic: {recall_lowslow:.3f}"
+        assert recall_mimicry >= 0.2, f"Mimicry recall catastrophic: {recall_mimicry:.3f}"
+        assert recall_masked >= 0.4, f"Feature masking recall catastrophic: {recall_masked:.3f}"
 
     def test_hopskipjump_attack(self):
         """Black-box attack using ART library (if installed).
@@ -241,3 +246,7 @@ class TestAdversarialRobustness:
         print(f"  Clean detected: {clean_detected}")
         print(f"  After attack:   {adv_detected}")
         print(f"  Evaded:         {evaded}")
+
+        adversarial_accuracy = adv_detected / len(attack_indices) if len(attack_indices) > 0 else 0
+        assert adversarial_accuracy >= 0.2, \
+            f"Model trivially breakable: adversarial accuracy {adversarial_accuracy:.3f}"

@@ -4,6 +4,14 @@ This document lists known limitations of the SDN DDoS detection system, organize
 
 ## Fundamental Limitations
 
+### Aggregate Feature Train/Serve Distribution Mismatch
+
+Features 10-12 (`flows_to_dst`, `unique_sources_to_dst`, `flow_creation_rate`) are computed differently during training and live serving. Training data computes them via dataset-wide `groupby` operations, which inflates counts for popular destinations. Live serving computes them over a sliding time window maintained by the controller. This distribution mismatch means the model may behave differently on live traffic than on test data, particularly for aggregate-dependent classification boundaries.
+
+**Impact:** The model may under-detect attacks targeting rarely-seen destinations (where live aggregates are low but training aggregates were high) or over-detect traffic to popular destinations.
+
+**Future work:** Generate training data using a sliding-window simulation that matches the controller's 5-second polling interval. Alternatively, normalize aggregate features to relative values (e.g., percentiles) that are distribution-invariant.
+
 ### Random Forest cannot detect novel zero-day attacks
 
 The classifier is trained on known attack patterns (ICMP flood, SYN flood, UDP flood). Novel attack vectors that don't match learned feature distributions will be classified as normal traffic. This relates to audit findings ML-05 and ML-07.

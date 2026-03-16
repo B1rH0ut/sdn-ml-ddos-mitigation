@@ -20,6 +20,19 @@ extracts from OpenFlow statistics.
 | 11 | `unique_sources_to_dst` | `groupby("Destination IP")["Source IP"].nunique()` | `groupby("Dst IP")["Src IP"].nunique()` | `groupby("dstip")["srcip"].nunique()` | Unique source IPs per destination | Approximate (dataset-wide vs. time-window) |
 | 12 | `flow_creation_rate` | Derived from `Timestamp` ordering | Derived from `Timestamp` ordering | Derived from `stime` ordering | Rolling mean of inter-flow arrival rate per destination | Approximate (depends on timestamp resolution) |
 
+## Train/Serve Alignment
+
+| # | Feature | Train/Serve Aligned? | Notes |
+|---|---------|---------------------|-------|
+| 1-6 | Per-flow features | Yes | Computed identically from flow stats |
+| 7 | `ip_proto` | Yes | Direct from OpenFlow match |
+| 8-9 | `icmp_code`, `icmp_type` | Partial | Real datasets use heuristic (type=8 for ICMP); controller extracts exact values |
+| 10 | `flows_to_dst` | **No** | Training: dataset-wide groupby; Serving: sliding time window |
+| 11 | `unique_sources_to_dst` | **No** | Training: dataset-wide groupby; Serving: sliding time window |
+| 12 | `flow_creation_rate` | **No** | Training: rolling mean over sorted timestamps; Serving: real-time rate |
+
+See `docs/KNOWN_LIMITATIONS.md` for the full discussion of aggregate feature train/serve skew.
+
 ## Key Limitations
 
 1. **ICMP code/type (features 8-9):** CICFlowMeter and Argus/Bro-IDS do not export

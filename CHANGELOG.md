@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-03-16
+
+### Fixed
+- **CRITICAL: Anti-spoofing ALLOW rules** — IPv4 ALLOW rules now use `OFPP_NORMAL` instead of `OFPP_CONTROLLER`, preventing all legitimate IPv4 traffic from being sent through PacketIn. ARP ALLOW rules still use `OFPP_CONTROLLER` for ARP proxy.
+- **Unbounded `_arp_cache` and `_prev_flow_stats`** — replaced bare dicts with `TTLCache(maxsize=1024, ttl=300)` and `TTLCache(maxsize=10000, ttl=300)` respectively to prevent OOM.
+- **Dead `_log_attack()` CSV writer** — attack detections now append to `attacks_log.csv` in addition to logging.
+- **Adversarial test assertions** — `test_evasion_scenarios` and `test_hopskipjump_attack` now assert minimum recall/accuracy thresholds instead of being purely informational.
+- **Magic numbers** — extracted `SPOOF_DETECTION_MIN_UNIQUE_SOURCES` and `SPOOF_DETECTION_MIN_FLOWS_TO_DST` constants.
+- **Code duplication** — `_block_across_all_switches` and `_block_by_destination` now share `_install_block_on_all_datapaths`.
+- **Stale docstring** — `feature_engineering.py` module docstring updated to current import paths.
+
+### Added
+- **Integration tests** — 6 tests covering detection→mitigation pipeline, circuit breaker fallback, queue overflow, and spoofed-source blocking.
+- **Dataset adapter value verification tests** — 5 tests verifying microsecond conversion, packet aggregation, protocol mapping, infinity handling, and PPS calculation.
+- **Type hints** — `from __future__ import annotations` and public function signatures in `feature_engineering.py`, `circuit_breaker.py`, `drift_detector.py`, and `bounded_cache.py`.
+- **Train/serve skew documentation** — documented aggregate feature distribution mismatch in `docs/KNOWN_LIMITATIONS.md`, `FEATURE_MAPPING.md`, and inline comments.
+
 ## [3.0.0] - 2026-03-16
 
 ### Breaking Changes

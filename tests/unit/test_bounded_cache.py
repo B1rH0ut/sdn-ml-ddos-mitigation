@@ -3,6 +3,7 @@
 import time
 
 import pytest
+from cachetools import TTLCache
 
 from sdn_ddos_detector.utils.bounded_cache import (
     BoundedMACTable,
@@ -95,3 +96,22 @@ class TestFlowStatsBuffer:
         assert buf.get_previous() is None
         buf.append({"packets": 100})
         assert buf.get_previous() == {"packets": 100}
+
+
+# ── TTLCache for ARP cache (v3.1.0) ────────────────────────────────────────
+
+class TestTTLCacheForArp:
+    """Verify TTLCache behaves correctly as ARP cache replacement."""
+
+    def test_arp_cache_ttl_eviction(self):
+        cache = TTLCache(maxsize=1024, ttl=0.1)
+        cache["10.0.0.1"] = "aa:bb:cc:dd:ee:ff"
+        assert "10.0.0.1" in cache
+        time.sleep(0.2)
+        assert "10.0.0.1" not in cache
+
+    def test_arp_cache_maxsize_bounded(self):
+        cache = TTLCache(maxsize=3, ttl=60)
+        for i in range(10):
+            cache[f"10.0.0.{i}"] = f"mac_{i}"
+        assert len(cache) <= 3

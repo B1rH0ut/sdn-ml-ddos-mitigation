@@ -11,8 +11,11 @@ States:
     HALF_OPEN - Testing whether ML model has recovered.
 """
 
+from __future__ import annotations
+
 import logging
 import time
+from typing import Any, Callable
 
 import numpy as np
 
@@ -62,7 +65,7 @@ class MLCircuitBreaker:
                 )
         return self._state
 
-    def call(self, func, *args, fallback=None, **kwargs):
+    def call(self, func: Callable, *args: Any, fallback: Callable | None = None, **kwargs: Any) -> Any:
         """
         Call func with circuit breaker protection.
 
@@ -140,7 +143,7 @@ class MLCircuitBreaker:
                 self._fail_count
             )
 
-    def get_stats(self):
+    def get_stats(self) -> dict[str, Any]:
         """Return circuit breaker statistics."""
         return {
             "state": self.state,
@@ -163,7 +166,7 @@ class ThresholdFallbackDetector:
         self.pps_threshold = pps_threshold
         self.bps_threshold = bps_threshold
 
-    def detect(self, features_dict):
+    def detect(self, features_dict: dict[str, float]) -> dict[str, Any]:
         """Detect a single flow using threshold heuristics.
 
         Args:
@@ -182,7 +185,7 @@ class ThresholdFallbackDetector:
             "method": "threshold_fallback",
         }
 
-    def detect_batch(self, features_array):
+    def detect_batch(self, features_array: np.ndarray) -> np.ndarray:
         """Detect a batch of flows, returning probabilities array.
 
         Mimics model.predict_proba() output shape: (n_samples, 2).
