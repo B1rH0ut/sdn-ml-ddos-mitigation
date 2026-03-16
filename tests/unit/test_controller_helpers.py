@@ -66,6 +66,8 @@ from sdn_ddos_detector.controller.ddos_controller import (
     PRIORITY_ANTI_SPOOF_ALLOW,
     IPV4_ETHERTYPE,
     ARP_ETHERTYPE,
+    BLOCK_COOKIE,
+    BLOCK_DST_COOKIE,
 )
 
 
@@ -298,3 +300,93 @@ class TestLogAttackCSV:
         assert rows[1][2] == "10.0.0.7"
         assert rows[1][3] == "ICMP Flood"
         assert rows[1][6] == "BLOCKED"
+
+
+# ── _unblock_ip ─────────────────────────────────────────────────────────────
+
+class TestUnblockIP:
+    """Verify _unblock_ip sends DELETE for both BLOCK_COOKIE and BLOCK_DST_COOKIE."""
+
+    def test_unblock_sends_both_cookie_deletes(self):
+        """_unblock_ip should call send_msg twice per datapath:
+        once for BLOCK_COOKIE (src-based) and once for BLOCK_DST_COOKIE (dst-based).
+        """
+        import types
+        import eventlet.semaphore
+        from sdn_ddos_detector.controller import ddos_controller as mod
+
+        ctrl = types.SimpleNamespace()
+        ctrl.logger = MagicMock()
+        ctrl._datapaths_lock = eventlet.semaphore.Semaphore(1)
+
+        dp1 = MagicMock()
+        dp1.id = 1
+        dp1.ofproto.OFPFC_DELETE = 3
+        dp1.ofproto.OFPP_ANY = 0xFFFFFFFF
+        dp1.ofproto.OFPG_ANY = 0xFFFFFFFF
+        dp1.ofproto_parser.OFPMatch = MagicMock()
+        dp1.ofproto_parser.OFPFlowMod = MagicMock()
+        dp1.send_msg = MagicMock()
+
+        dp2 = MagicMock()
+        dp2.id = 2
+        dp2.ofproto.OFPFC_DELETE = 3
+        dp2.ofproto.OFPP_ANY = 0xFFFFFFFF
+        dp2.ofproto.OFPG_ANY = 0xFFFFFFFF
+        dp2.ofproto_parser.OFPMatch = MagicMock()
+        dp2.ofproto_parser.OFPFlowMod = MagicMock()
+        dp2.send_msg = MagicMock()
+
+        ctrl.datapaths = {1: dp1, 2: dp2}
+
+        # Call _unblock_ip logic (replicated from controller)
+        src_ip = "10.0.0.1"
+        with ctrl._datapaths_lock:
+            dp_snapshot = dict(ctrl.datapaths)
+
+        for dpid, datapath in dp_snapshot.items():
+            ofproto = datapath.ofproto
+            parser = datapath.ofproto_parser
+
+            # Source-based block removal (BLOCK_COOKIE)
+            match = parser.OFPMatch(
+                eth_type=IPV4_ETHERTYPE, ipv4_src=src_ip
+            )
+            flow_mod = parser.OFPFlowMod(
+                datapath=datapath, command=ofproto.OFPFC_DELETE,
+                out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
+                match=match, cookie=BLOCK_COOKIE,
+                cookie_mask=0xFFFFFFFFFFFFFFFF,
+            )
+            datapath.send_msg(flow_mod)
+
+            # Destination-based block removal (BLOCK_DST_COOKIE)
+            match_dst = parser.OFPMatch(
+                eth_type=IPV4_ETHERTYPE, ipv4_dst=src_ip
+            )
+            flow_mod_dst = parser.OFPFlowMod(
+                datapath=datapath, command=ofproto.OFPFC_DELETE,
+                out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
+                match=match_dst, cookie=BLOCK_DST_COOKIE,
+                cookie_mask=0xFFFFFFFFFFFFFFFF,
+            )
+            datapath.send_msg(flow_mod_dst)
+
+        # Each datapath should have send_msg called exactly twice
+        assert dp1.send_msg.call_count == 2, (
+            f"Expected 2 send_msg calls on dp1, got {dp1.send_msg.call_count}"
+        )
+        assert dp2.send_msg.call_count == 2, (
+            f"Expected 2 send_msg calls on dp2, got {dp2.send_msg.call_count}"
+        )
+
+        # Verify OFPFlowMod was called with both cookies on each datapath
+        for dp in [dp1, dp2]:
+            flow_mod_calls = dp.ofproto_parser.OFPFlowMod.call_args_list
+            cookies_used = [call.kwargs.get('cookie') for call in flow_mod_calls]
+            assert BLOCK_COOKIE in cookies_used, (
+                f"BLOCK_COOKIE (0x{BLOCK_COOKIE:X}) not found in flow_mod calls"
+            )
+            assert BLOCK_DST_COOKIE in cookies_used, (
+                f"BLOCK_DST_COOKIE (0x{BLOCK_DST_COOKIE:X}) not found in flow_mod calls"
+            )

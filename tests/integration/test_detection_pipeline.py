@@ -55,6 +55,7 @@ except ImportError:
 from sdn_ddos_detector.controller.ddos_controller import (
     PRIORITY_BLOCK, IPV4_ETHERTYPE, BLOCK_COOKIE, BLOCK_DST_COOKIE,
     SPOOF_DETECTION_MIN_UNIQUE_SOURCES, SPOOF_DETECTION_MIN_FLOWS_TO_DST,
+    FLOW_SAMPLE_TOP_N, FLOW_SAMPLE_PPS_THRESHOLD,
     _verify_model_integrity,
 )
 from sdn_ddos_detector.utils.bounded_cache import BoundedIPCounter
@@ -84,6 +85,13 @@ def _make_mock_datapath(dpid=1):
 
 def _make_controller_stub():
     """Create a minimal SimpleNamespace that mimics the controller.
+
+    Ryu's RyuApp.__init__ requires a running event loop and registered
+    application context, so we cannot instantiate the real
+    DDoSDetectionController class directly in tests. Instead, we
+    reconstruct the subset of controller state and methods needed for
+    integration testing using a SimpleNamespace, binding real method
+    logic from the controller module.
 
     Binds actual methods from the module for testing.
     """
@@ -310,3 +318,12 @@ class TestDetectionPipeline:
 
         item = queue.get_nowait()
         assert item == "item1"
+
+    def test_sampling_constants_are_sane(self):
+        """Verify imported sampling constants have expected values to catch regressions."""
+        assert FLOW_SAMPLE_TOP_N == 500, (
+            f"FLOW_SAMPLE_TOP_N changed from 500 to {FLOW_SAMPLE_TOP_N}"
+        )
+        assert FLOW_SAMPLE_PPS_THRESHOLD == 100, (
+            f"FLOW_SAMPLE_PPS_THRESHOLD changed from 100 to {FLOW_SAMPLE_PPS_THRESHOLD}"
+        )

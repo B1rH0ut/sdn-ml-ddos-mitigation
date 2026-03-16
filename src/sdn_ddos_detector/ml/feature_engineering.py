@@ -6,8 +6,8 @@ This module is the SINGLE SOURCE OF TRUTH for the ML feature set.
 All other modules import feature definitions from here:
     - sdn_ddos_detector.controller.ddos_controller
     - sdn_ddos_detector.ml.train (training pipeline)
-    - sdn_ddos_detector.ml.create_roc (ROC curve generation)
-    - sdn_ddos_detector.datasets.generate_full_dataset
+    - sdn_ddos_detector.ml.evaluation (ROC curve generation)
+    - sdn_ddos_detector.ml.generate_synthetic_dataset
     - sdn_ddos_detector.ml.dataset_adapters (real dataset adapters)
 
 Features (12 total, in exact order):

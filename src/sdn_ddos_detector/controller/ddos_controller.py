@@ -1421,6 +1421,8 @@ class DDoSDetectionController(app_manager.RyuApp):
             try:
                 ofproto = datapath.ofproto
                 parser = datapath.ofproto_parser
+
+                # Remove source-based block rules (BLOCK_COOKIE)
                 match = parser.OFPMatch(
                     eth_type=IPV4_ETHERTYPE, ipv4_src=src_ip
                 )
@@ -1431,6 +1433,18 @@ class DDoSDetectionController(app_manager.RyuApp):
                     cookie_mask=0xFFFFFFFFFFFFFFFF,
                 )
                 datapath.send_msg(flow_mod)
+
+                # Also remove destination-based block rules (BLOCK_DST_COOKIE)
+                match_dst = parser.OFPMatch(
+                    eth_type=IPV4_ETHERTYPE, ipv4_dst=src_ip
+                )
+                flow_mod_dst = parser.OFPFlowMod(
+                    datapath=datapath, command=ofproto.OFPFC_DELETE,
+                    out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
+                    match=match_dst, cookie=BLOCK_DST_COOKIE,
+                    cookie_mask=0xFFFFFFFFFFFFFFFF,
+                )
+                datapath.send_msg(flow_mod_dst)
             except Exception as e:
                 self.logger.error(
                     "Failed to unblock %s on dpid=%s: %s", src_ip, dpid, str(e)
