@@ -9,6 +9,8 @@ ADWIN uses Hoeffding bounds to detect distribution changes without
 adapting away the signal it should detect.
 """
 
+from __future__ import annotations
+
 import math
 import time
 from collections import deque
@@ -45,7 +47,7 @@ class DriftMonitor:
         self._drift_count = 0
         self._last_drift_time = None
 
-    def update(self, prediction_error):
+    def update(self, prediction_error: float) -> DriftResult:
         """Feed a prediction error value (0.0 = correct, 1.0 = incorrect).
 
         Args:
@@ -76,7 +78,7 @@ class DriftMonitor:
 
         return DriftResult(detected=detected, stats=self.get_stats())
 
-    def get_stats(self):
+    def get_stats(self) -> dict[str, object]:
         """Return current drift detection statistics."""
         return {
             "method": self._method,

@@ -121,3 +121,70 @@ class TestUNSWNB15Adapter:
         df_with_split = unsw_nb15_df.copy()
         df_with_split["_split"] = ["train", "test"]
         assert adapter.has_predefined_split(df_with_split) is True
+
+
+# ── Value Verification Tests (v3.1.0) ──────────────────────────────────────
+
+class TestCICIDS2017ValueVerification:
+    """Verify actual mapped values, not just column presence."""
+
+    def test_duration_microsecond_conversion(self, cic_ids2017_df):
+        """CIC-IDS2017 stores duration in microseconds; must convert to seconds."""
+        adapter = CICIDS2017Adapter()
+        result = adapter.map_features(cic_ids2017_df)
+        # First row: 1_000_000 microseconds = 1.0 second
+        assert abs(result["flow_duration_sec"].iloc[0] - 1.0) < 1e-6
+        # Second row: 500_000 microseconds = 0.5 seconds
+        assert abs(result["flow_duration_sec"].iloc[1] - 0.5) < 1e-6
+
+    def test_packet_count_aggregation(self, cic_ids2017_df):
+        """packet_count = Total Fwd Packets + Total Backward Packets."""
+        adapter = CICIDS2017Adapter()
+        result = adapter.map_features(cic_ids2017_df)
+        # First row: 10 + 8 = 18
+        assert result["packet_count"].iloc[0] == 18
+        # Second row: 5000 + 100 = 5100
+        assert result["packet_count"].iloc[1] == 5100
+
+    def test_infinity_handling(self):
+        """Infinity values in rate columns should be replaced, not propagated."""
+        df = pd.DataFrame({
+            "Flow Duration": [0, 1_000_000],
+            "Total Fwd Packets": [100, 10],
+            "Total Backward Packets": [0, 5],
+            "Total Length of Fwd Packets": [5000, 3000],
+            "Total Length of Bwd Packets": [0, 2000],
+            "Protocol": [6, 6],
+            "Flow Bytes/s": [np.inf, 5000.0],
+            "Label": ["BENIGN", "BENIGN"],
+        })
+        adapter = CICIDS2017Adapter()
+        result = adapter.map_features(df)
+        # No infinities should remain
+        assert not np.any(np.isinf(result.select_dtypes(include=[np.number]).values))
+
+
+class TestUNSWNB15ValueVerification:
+
+    def test_protocol_string_to_number(self, unsw_nb15_df):
+        """UNSW-NB15 uses string protocol names that must map to numbers."""
+        adapter = UNSWNB15Adapter()
+        result = adapter.map_features(unsw_nb15_df)
+        # First row: "tcp" → 6
+        assert result["ip_proto"].iloc[0] == 6
+        # Second row: "udp" → 17
+        assert result["ip_proto"].iloc[1] == 17
+
+
+class TestPPSCalculation:
+
+    def test_pps_from_mapped_features(self, cic_ids2017_df):
+        """packet_count_per_second = packet_count / duration_sec."""
+        adapter = CICIDS2017Adapter()
+        result = adapter.map_features(cic_ids2017_df)
+        # Row 0: packets=18, duration=1.0s → pps=18.0
+        expected_pps = 18.0 / 1.0
+        assert abs(result["packet_count_per_second"].iloc[0] - expected_pps) < 1e-3
+        # Row 1: packets=5100, duration=0.5s → pps=10200.0
+        expected_pps2 = 5100.0 / 0.5
+        assert abs(result["packet_count_per_second"].iloc[1] - expected_pps2) < 1e-3

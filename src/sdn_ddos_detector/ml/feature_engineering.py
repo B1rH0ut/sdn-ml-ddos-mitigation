@@ -4,11 +4,11 @@ Feature Extraction Utility for DDoS Detection
 
 This module is the SINGLE SOURCE OF TRUTH for the ML feature set.
 All other modules import feature definitions from here:
-    - sdn_controller/mitigation_module.py
-    - ml_model/train_model.py
-    - ml_model/create_roc.py
-    - datasets/generate_full_dataset.py
-    - utilities/dataset_collector.py
+    - sdn_ddos_detector.controller.ddos_controller
+    - sdn_ddos_detector.ml.train (training pipeline)
+    - sdn_ddos_detector.ml.create_roc (ROC curve generation)
+    - sdn_ddos_detector.datasets.generate_full_dataset
+    - sdn_ddos_detector.ml.dataset_adapters (real dataset adapters)
 
 Features (12 total, in exact order):
     1.  flow_duration_sec        - Flow duration in seconds
@@ -41,6 +41,8 @@ Usage:
 
 """
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
@@ -71,7 +73,7 @@ CSV_HEADERS = FEATURE_NAMES + ['label']
 LABEL_COLUMN = 'label'
 
 
-def extract_flow_features(flow_stats, aggregates=None):
+def extract_flow_features(flow_stats: dict, aggregates: dict | None = None) -> np.ndarray:
     """
     Extract 12 ML features from a flow statistics dictionary.
 
@@ -131,6 +133,9 @@ def extract_flow_features(flow_stats, aggregates=None):
         avg_packet_size = 0
 
     # Aggregate features (per-destination behavior)
+    # NOTE: Train/serve distribution mismatch — training data computes these
+    # via dataset-wide groupby; live serving uses a sliding time window.
+    # See docs/KNOWN_LIMITATIONS.md for details.
     if aggregates is not None:
         flows_to_dst = aggregates.get('flows_to_dst', 0)
         unique_sources_to_dst = aggregates.get('unique_sources_to_dst', 0)
@@ -159,7 +164,7 @@ def extract_flow_features(flow_stats, aggregates=None):
     return np.array(features).reshape(1, -1)
 
 
-def validate_features(features):
+def validate_features(features: np.ndarray) -> tuple[bool, str]:
     """
     Validate a feature array for ML prediction compatibility.
 
@@ -206,7 +211,7 @@ def validate_features(features):
     return True, ""
 
 
-def features_to_dict(features):
+def features_to_dict(features: np.ndarray) -> dict[str, float]:
     """
     Convert a feature array back to a labeled dictionary.
 
@@ -230,7 +235,7 @@ def features_to_dict(features):
     return dict(zip(FEATURE_NAMES, values))
 
 
-def extract_flow_features_from_stats(flow_stats, prev_stats=None, window_seconds=5.0):
+def extract_flow_features_from_stats(flow_stats: dict, prev_stats: dict | None = None, window_seconds: float = 5.0) -> dict[str, float]:
     """
     Extract features from raw OpenFlow flow stats.
 
@@ -302,7 +307,7 @@ def extract_flow_features_from_stats(flow_stats, prev_stats=None, window_seconds
     }
 
 
-def features_dict_to_array(features_dict):
+def features_dict_to_array(features_dict: dict[str, float]) -> np.ndarray:
     """Convert a features dict (from extract_flow_features_from_stats) to a numpy array.
 
     Returns:
@@ -311,7 +316,7 @@ def features_dict_to_array(features_dict):
     return np.array([[features_dict[name] for name in FEATURE_NAMES]])
 
 
-def validate_feature_distributions(train_df, serve_df, threshold=0.05):
+def validate_feature_distributions(train_df: pd.DataFrame, serve_df: pd.DataFrame, threshold: float = 0.05) -> dict:
     """Detect distribution shift between training and serving features.
 
     Uses the Kolmogorov-Smirnov test per feature to detect whether the

@@ -62,6 +62,7 @@ from sdn_ddos_detector.ml.feature_engineering import (
 from sdn_ddos_detector.utils.bounded_cache import (
     BoundedMACTable, BoundedIPCounter, BoundedFloodHistory,
 )
+from cachetools import TTLCache
 from sdn_ddos_detector.utils.logging_config import setup_logging
 from sdn_ddos_detector.ml.drift_detector import DriftMonitor
 from sdn_ddos_detector.ml.circuit_breaker import MLCircuitBreaker, ThresholdFallbackDetector
@@ -144,6 +145,10 @@ ML_INFERENCE_TIMEOUT = 4  # seconds
 
 # Stats reply collection deadline
 STATS_REPLY_DEADLINE = 2  # seconds
+
+# Spoofed-source DDoS detection thresholds (v3.1.0: extracted from inline magic numbers)
+SPOOF_DETECTION_MIN_UNIQUE_SOURCES = 10
+SPOOF_DETECTION_MIN_FLOWS_TO_DST = 15
 
 # Syslog integration
 SYSLOG_ADDRESS = '/dev/log'
@@ -322,8 +327,8 @@ class DDoSDetectionController(app_manager.RyuApp):
         self._flood_history = BoundedFloodHistory(maxsize=512)
         self._flood_suppress_window = 1.0
 
-        # ARP proxy cache: {ip: mac} for ARP response
-        self._arp_cache = {}
+        # ARP proxy cache: {ip: mac} — bounded to prevent OOM (v3.1.0)
+        self._arp_cache = TTLCache(maxsize=1024, ttl=300)
 
         # Shutdown flag
         self._shutting_down = False
@@ -342,7 +347,8 @@ class DDoSDetectionController(app_manager.RyuApp):
 
         # Previous flow stats for rate-of-change features (audit 9.7)
         # {(dpid, match_key): {packet_count, byte_count, timestamp}}
-        self._prev_flow_stats = {}
+        # Bounded to prevent OOM (v3.1.0)
+        self._prev_flow_stats = TTLCache(maxsize=10000, ttl=300)
 
         # Flow table capacity tracking (audit 7.4)
         self._flow_table_sizes = {}
@@ -761,43 +767,32 @@ class DDoSDetectionController(app_manager.RyuApp):
     def _install_anti_spoof_rules(self, datapath):
         """Install BCP38 anti-spoofing rules on leaf host-facing ports.
 
-        For each host-facing port:
-          Priority 50: ALLOW IP packets with matching source IP → forward normally
-          Priority 40: DROP all other IP packets on that port → [] (catches spoofed)
-          Priority 50: ALLOW ARP with matching arp_spa → forward normally
-          Priority 40: DROP ARP with non-matching arp_spa → [] (catches ARP spoofing)
+        Design: Two-priority scheme per port per protocol:
+          Priority 50 (ALLOW): Matches legitimate source IP/ARP SPA.
+          Priority 40 (DROP):  Catches everything else on that port (spoofed).
+
+        IPv4 ALLOW uses OFPP_NORMAL so OVS handles forwarding without sending
+        every legitimate packet through PacketIn. ARP ALLOW still uses
+        OFPP_CONTROLLER because the ARP proxy needs to see ARP requests.
         """
         dpid = datapath.id
         parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
         port_ips = HOST_PORT_ALLOWED_IPS.get(dpid, {})
 
         if not port_ips:
             return
 
         for port_no, (allowed_ip, allowed_mask) in port_ips.items():
-            # IPv4: ALLOW matching source IP on this port
+            # IPv4: ALLOW matching source IP → OFPP_NORMAL (OVS L2 pipeline)
             match_allow = parser.OFPMatch(
                 in_port=port_no, eth_type=IPV4_ETHERTYPE,
                 ipv4_src=(allowed_ip, allowed_mask),
             )
-            # Action: send to table (normal processing) — empty instruction
-            # means "continue to next table" but since we use single table,
-            # we use GOTO or just don't install a DROP. The ALLOW rule at
-            # priority 50 will match before the DROP at priority 40.
-            # We use a no-op flow that just lets the packet continue matching.
-            ofproto = datapath.ofproto
-            actions_allow = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
-            # Actually, we want to let normal forwarding handle it.
-            # Priority 50 ALLOW = just let it through (match and do nothing special,
-            # so it falls to priority 10 forwarding). Use "goto table" or just
-            # install with a controller action to trigger normal PacketIn handling.
-            # Simplest: install a flow that outputs to CONTROLLER so normal
-            # PacketIn processing occurs.
             self._add_flow(
                 datapath, priority=PRIORITY_ANTI_SPOOF_ALLOW,
                 match=match_allow,
-                actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                                ofproto.OFPCML_NO_BUFFER)],
+                actions=[parser.OFPActionOutput(ofproto.OFPP_NORMAL)],
             )
 
             # IPv4: DROP all other source IPs on this port (catches spoofed)
@@ -809,7 +804,7 @@ class DDoSDetectionController(app_manager.RyuApp):
                 match=match_drop, actions=[],
             )
 
-            # ARP: ALLOW matching arp_spa on this port
+            # ARP: ALLOW matching arp_spa → OFPP_CONTROLLER (ARP proxy needs it)
             match_arp_allow = parser.OFPMatch(
                 in_port=port_no, eth_type=ARP_ETHERTYPE,
                 arp_spa=(allowed_ip, allowed_mask),
@@ -1260,8 +1255,10 @@ class DDoSDetectionController(app_manager.RyuApp):
             flows_to_dst = self._network_dst_flow_counts.get(dst_ip, 0)
 
             # High source entropy: many unique sources to same destination
-            is_spoofed_source = (unique_sources_to_dst >= 10
-                                 and flows_to_dst >= 15)
+            is_spoofed_source = (
+                unique_sources_to_dst >= SPOOF_DETECTION_MIN_UNIQUE_SOURCES
+                and flows_to_dst >= SPOOF_DETECTION_MIN_FLOWS_TO_DST
+            )
 
             if is_spoofed_source:
                 self.logger.warning(
@@ -1314,6 +1311,45 @@ class DDoSDetectionController(app_manager.RyuApp):
     # Network-wide mitigation (audit 2.4)
     # =========================================================================
 
+    def _install_block_on_all_datapaths(self, match_fields, cookie,
+                                         hard_timeout=300, idle_timeout=60):
+        """Install a DROP rule on ALL connected switches (leaf-first ordering).
+
+        Args:
+            match_fields: Dict of OFPMatch keyword arguments.
+            cookie: Flow cookie for later identification/deletion.
+            hard_timeout: Absolute expiry in seconds.
+            idle_timeout: Idle expiry in seconds.
+
+        Returns:
+            Tuple of (blocked_count, total_switches).
+        """
+        with self._datapaths_lock:
+            dp_snapshot = dict(self.datapaths)
+
+        leaf_dps = [(dpid, dp) for dpid, dp in dp_snapshot.items()
+                    if dpid in LEAF_DPIDS]
+        spine_dps = [(dpid, dp) for dpid, dp in dp_snapshot.items()
+                     if dpid in SPINE_DPIDS]
+        blocked_count = 0
+
+        for dpid, datapath in leaf_dps + spine_dps:
+            try:
+                parser = datapath.ofproto_parser
+                match = parser.OFPMatch(**match_fields)
+                self._add_flow(
+                    datapath, priority=PRIORITY_BLOCK, match=match,
+                    actions=[], hard_timeout=hard_timeout,
+                    idle_timeout=idle_timeout, cookie=cookie,
+                )
+                blocked_count += 1
+            except Exception as e:
+                self.logger.error(
+                    "Failed to install block on dpid=%s: %s", dpid, str(e)
+                )
+
+        return blocked_count, len(dp_snapshot)
+
     def _block_across_all_switches(self, src_ip, dst_ip=None, ip_proto=None,
                                     timeout=None):
         """Install DROP rule on ALL connected switches.
@@ -1333,40 +1369,19 @@ class DDoSDetectionController(app_manager.RyuApp):
                                 src_ip, dst_ip)
             return
 
-        with self._datapaths_lock:
-            dp_snapshot = dict(self.datapaths)
+        match_fields = {'eth_type': IPV4_ETHERTYPE, 'ipv4_src': src_ip}
+        if dst_ip:
+            match_fields['ipv4_dst'] = dst_ip
+        if ip_proto and ip_proto > 0:
+            match_fields['ip_proto'] = ip_proto
 
-        # Install on leaf switches first, then spines
-        leaf_dps = [(dpid, dp) for dpid, dp in dp_snapshot.items()
-                    if dpid in LEAF_DPIDS]
-        spine_dps = [(dpid, dp) for dpid, dp in dp_snapshot.items()
-                     if dpid in SPINE_DPIDS]
-        blocked_count = 0
-
-        for dpid, datapath in leaf_dps + spine_dps:
-            try:
-                parser = datapath.ofproto_parser
-                match_fields = {'eth_type': IPV4_ETHERTYPE, 'ipv4_src': src_ip}
-                if dst_ip:
-                    match_fields['ipv4_dst'] = dst_ip
-                if ip_proto and ip_proto > 0:
-                    match_fields['ip_proto'] = ip_proto
-
-                match = parser.OFPMatch(**match_fields)
-                self._add_flow(
-                    datapath, priority=PRIORITY_BLOCK, match=match,
-                    actions=[], hard_timeout=timeout, idle_timeout=60,
-                    cookie=BLOCK_COOKIE,
-                )
-                blocked_count += 1
-            except Exception as e:
-                self.logger.error(
-                    "Failed to install block on dpid=%s: %s", dpid, str(e)
-                )
+        blocked_count, total = self._install_block_on_all_datapaths(
+            match_fields, BLOCK_COOKIE, hard_timeout=timeout, idle_timeout=60,
+        )
 
         self.logger.info(
             "BLOCKED: src=%s dst=%s proto=%s on %d/%d switches (expires %ds)",
-            src_ip, dst_ip, ip_proto, blocked_count, len(dp_snapshot), timeout
+            src_ip, dst_ip, ip_proto, blocked_count, total, timeout
         )
 
     def _block_by_destination(self, dst_ip, ip_proto=None, timeout=None):
@@ -1384,36 +1399,17 @@ class DDoSDetectionController(app_manager.RyuApp):
             self.logger.warning("Invalid dst IP in block request: %s", dst_ip)
             return
 
-        with self._datapaths_lock:
-            dp_snapshot = dict(self.datapaths)
+        match_fields = {'eth_type': IPV4_ETHERTYPE, 'ipv4_dst': dst_ip}
+        if ip_proto and ip_proto > 0:
+            match_fields['ip_proto'] = ip_proto
 
-        leaf_dps = [(dpid, dp) for dpid, dp in dp_snapshot.items()
-                    if dpid in LEAF_DPIDS]
-        spine_dps = [(dpid, dp) for dpid, dp in dp_snapshot.items()
-                     if dpid in SPINE_DPIDS]
-        blocked_count = 0
-
-        for dpid, datapath in leaf_dps + spine_dps:
-            try:
-                parser = datapath.ofproto_parser
-                match_fields = {'eth_type': IPV4_ETHERTYPE, 'ipv4_dst': dst_ip}
-                if ip_proto and ip_proto > 0:
-                    match_fields['ip_proto'] = ip_proto
-                match = parser.OFPMatch(**match_fields)
-                self._add_flow(
-                    datapath, priority=PRIORITY_BLOCK, match=match,
-                    actions=[], hard_timeout=timeout, idle_timeout=60,
-                    cookie=BLOCK_DST_COOKIE,
-                )
-                blocked_count += 1
-            except Exception as e:
-                self.logger.error(
-                    "Failed to install dst block on dpid=%s: %s", dpid, str(e)
-                )
+        blocked_count, total = self._install_block_on_all_datapaths(
+            match_fields, BLOCK_DST_COOKIE, hard_timeout=timeout, idle_timeout=60,
+        )
 
         self.logger.info(
             "BLOCKED BY DST: dst=%s proto=%s on %d/%d switches (expires %ds)",
-            dst_ip, ip_proto, blocked_count, len(dp_snapshot), timeout
+            dst_ip, ip_proto, blocked_count, total, timeout
         )
 
     def _unblock_ip(self, src_ip):
@@ -1545,13 +1541,9 @@ class DDoSDetectionController(app_manager.RyuApp):
 
             self._age_mac_table()
 
-            # Trim stale prev_flow_stats entries (older than 5 minutes)
-            stale_keys = [
-                k for k, v in self._prev_flow_stats.items()
-                if now - v.get('timestamp', 0) > 300
-            ]
-            for k in stale_keys:
-                del self._prev_flow_stats[k]
+            # TTLCache auto-evicts stale _prev_flow_stats entries (v3.1.0)
+            # Trigger eviction by accessing the cache
+            self._prev_flow_stats.expire()
 
         self.logger.info("Cleanup thread exiting (shutdown)")
 
@@ -1569,3 +1561,18 @@ class DDoSDetectionController(app_manager.RyuApp):
             "action=BLOCKED switches=%d",
             safe_src, safe_dst, attack_type, packet_rate, confidence, n_switches
         )
+        # Write to CSV attack log (v3.1.0: fix dead CSV writer)
+        try:
+            import csv
+            import datetime
+            log_file = os.path.join(self.log_dir, 'attacks_log.csv')
+            with open(log_file, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    datetime.datetime.now().isoformat(),
+                    safe_src, safe_dst, attack_type,
+                    f"{packet_rate:.2f}", f"{confidence:.3f}",
+                    "BLOCKED", n_switches,
+                ])
+        except IOError as e:
+            self.logger.error("Failed to write attack log CSV: %s", str(e))
