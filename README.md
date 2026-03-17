@@ -12,6 +12,8 @@ An intelligent network security system that combines **Software-Defined Networki
 
 ## Quick Start
 
+**Python 3.10–3.13 required.** Python 3.14+ is not yet supported due to dependency compatibility (Ryu, river).
+
 ```bash
 git clone https://github.com/B1rH0ut/sdn-ml-ddos-mitigation.git
 cd sdn-ml-ddos-mitigation
@@ -231,7 +233,7 @@ Dataset adapters automatically map each dataset's columns to the 12-feature sche
 | Testing                 | pytest (91 tests)                                             |
 | Linting                 | ruff                                                          |
 | Containerization        | Docker + Docker Compose                                       |
-| Language                | Python 3.10+                                                  |
+| Language                | Python 3.10–3.13                                              |
 
 ---
 

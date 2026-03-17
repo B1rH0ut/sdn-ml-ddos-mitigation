@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "sdn-ddos-detector"
 version = "3.1.0"
 description = "SDN-Based DDoS Detection and Mitigation System using Machine Learning"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = {text = "MIT"}
 dependencies = [
     "ryu>=4.34",
