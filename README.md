@@ -281,7 +281,7 @@ See [`docker/README.md`](docker/README.md) for details. Note: the Mininet contai
   title        = {{SDN}-Based {DDoS} Detection and Mitigation with Machine Learning},
   year         = {2026},
   howpublished = {\url{https://github.com/B1rH0ut/sdn-ml-ddos-mitigation}},
-  note         = {v3.0.0 — Research-grade SDN DDoS detection validated on CIC-IDS2017, CIC-DDoS2019, UNSW-NB15}
+  note         = {v3.1.0 — Research-grade SDN DDoS detection validated on CIC-IDS2017, CIC-DDoS2019, UNSW-NB15}
 }
 ```
 
